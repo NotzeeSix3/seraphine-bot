@@ -211,6 +211,28 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
 # Antrean musik per server
 music_queues = defaultdict(list)
+music_loop = defaultdict(bool)  # guild_id -> loop current track
+
+_MUSIC_ERROR_HINTS = [
+    ("no longer valid", "🍪 Cookie YouTube kedaluwarsa/dirotasi — Notzee harus refresh YOUTUBE_COOKIES di Railway."),
+    ("rotated", "🍪 Cookie YouTube kedaluwarsa/dirotasi — refresh YOUTUBE_COOKIES di Railway."),
+    ("sign in to confirm", "🤖 YouTube minta verifikasi bot-check — coba lagi nanti / refresh cookies."),
+    ("bot-check", "🤖 YouTube nge-flag akses bot — coba lagi nanti / refresh cookies."),
+    ("age", "🔞 Video kena age-gate, butuh akses khusus."),
+    ("private", "🔒 Video private atau udah dihapus."),
+    ("unavailable", "🚫 Video unavailable (region/warna-hapus)."),
+    ("403", "🚫 Stream ditolak server (403) — coba skip atau mainin lagu lain."),
+    ("ffmpeg", "⚙️ FFmpeg error internal — coba skip ke lagu berikutnya."),
+]
+
+def _translate_music_error(e: Exception) -> str:
+    """Map raw yt-dlp/ffmpeg error ke pesan user yang actionable."""
+    msg = str(e or "").lower()
+    for marker, hint in _MUSIC_ERROR_HINTS:
+        if marker in msg:
+            return hint
+    return f"❌ Gagal putar musik: {str(e)[:120]}"
+
 
 class MusicControlView(discord.ui.View):
     def __init__(self, guild_id):
@@ -295,9 +317,19 @@ async def _autoplay_next(guild_id, voice_client, channel):
         logger.error(f"Autoplay error: {e}")
 
 def play_next(guild_id, voice_client, channel):
+    # Loop aktif: replay source terakhir (disimpan di atribut voice_client)
+    if music_loop.get(guild_id) and voice_client.is_connected():
+        src = getattr(voice_client, "_last_source", None)
+        if src is not None:
+            try:
+                voice_client.play(src, after=lambda e: play_next(guild_id, voice_client, channel))
+                return
+            except Exception as e:
+                logger.error(f"Loop replay error: {e}")
     if music_queues[guild_id]:
         next_player = music_queues[guild_id].pop(0)
         try:
+            voice_client._last_source = next_player
             voice_client.play(next_player, after=lambda e: play_next(guild_id, voice_client, channel))
             view = MusicControlView(guild_id)
             future = asyncio.run_coroutine_threadsafe(
@@ -867,7 +899,8 @@ def build_help_embed() -> discord.Embed:
     embed.add_field(
         name="🎵 Musik (Slash)",
         value="`/splay` - Putar dari YouTube\n`/squeue` - Lihat antrean\n`/sskip` - Lewati lagu\n"
-              "`/spause` - Pause / resume\n`/snowplaying` - Lagu yang lagi diputar\n`/sstop` - Stop & keluar VC",
+              "`/spause` - Pause\n`/sresume` - Resume\n`/sloop` - Loop lagu\n`/sshuffle` - Acak antrean\n"
+              "`/snowplaying` - Lagu yang lagi diputar\n`/sstop` - Stop & keluar VC",
         inline=False
     )
     embed.add_field(
@@ -933,6 +966,7 @@ async def slash_play(interaction: discord.Interaction, query: str):
         player = await YTDLSource.from_url(query, loop=client.loop, stream=True)
         
         if not voice_client.is_playing():
+            voice_client._last_source = player
             voice_client.play(player, after=lambda e: play_next(interaction.guild.id, voice_client, interaction.channel))
             embed = discord.Embed(
                 title="🎵 Sekarang Diputar",
@@ -960,7 +994,7 @@ async def slash_play(interaction: discord.Interaction, query: str):
         except:
             pass
 
-        err_msg = f"❌ Aduh, error pas putar musik: {str(e)[:100]}"
+        err_msg = _translate_music_error(e)
         try:
             await interaction.followup.send(err_msg)
         except:
@@ -1047,9 +1081,35 @@ async def slash_stop(interaction: discord.Interaction):
     if voice_client:
         await voice_client.disconnect()
         music_queues[interaction.guild.id] = []
+        music_loop[interaction.guild.id] = False
         await interaction.response.send_message("🛑 Musik dihentikan dan bot disconnect.")
     else:
         await interaction.response.send_message("❌ Bot lagi gak ada di voice channel.", ephemeral=True)
+
+@tree.command(name="sloop", description="Toggle loop lagu yang lagi diputar (Seraphine)")
+async def slash_loop(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if not vc or not (vc.is_playing() or vc.is_paused()):
+        await interaction.response.send_message("❌ Gak ada lagu yang lagi diputar bro.", ephemeral=True)
+        return
+    music_loop[interaction.guild.id] = not music_loop[interaction.guild.id]
+    state = "AKTIF 🔁" if music_loop[interaction.guild.id] else "MATI ➡️"
+    await interaction.response.send_message(f"🔁 Loop lagu sekarang **{state}**.", ephemeral=True)
+
+@tree.command(name="sshuffle", description="Acak urutan antrean musik (Seraphine)")
+async def slash_shuffle(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    queue = music_queues.get(interaction.guild.id, [])
+    if len(queue) < 2:
+        await interaction.response.send_message("❌ Antrean kurang dari 2 lagu, gak ada yang diacak.", ephemeral=True)
+        return
+    random.shuffle(queue)
+    await interaction.response.send_message(f"🔀 Antrean diacak! Total {len(queue)} lagu.", ephemeral=True)
 
 # ============================================================
 #  DATABASE FUNCTIONS
@@ -1684,7 +1744,7 @@ async def on_message(pesan):
     # ============================================================
     #  PREFIX REDIRECT: musik & moderasi sekarang slash-only
     # ============================================================
-    if command in ["play", "splay", "queue", "squeue", "skip", "sskip", "stop", "sstop", "pause", "spause", "resume", "sresume", "nowplaying", "snowplaying"]:
+    if command in ["play", "splay", "queue", "squeue", "skip", "sskip", "stop", "sstop", "pause", "spause", "resume", "sresume", "nowplaying", "snowplaying", "loop", "sloop", "shuffle", "sshuffle"]:
         await pesan.reply("🎵 Command musik sekarang pakai **Slash Command (`/`)** khusus Seraphine bro! Coba ketik `/splay`, `/squeue`, `/sskip`, atau `/sstop` 😉")
         return
 
