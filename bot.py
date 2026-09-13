@@ -536,6 +536,69 @@ def check_rate_limit(user_id: int) -> bool:
     return True
 
 # ============================================================
+#  ANTI-SPAM (flood / invite / mass-mention)
+# ============================================================
+
+import re as _re
+_INVITE_RE = _re.compile(r'(discord\.(gg|io|me|li)|discordapp\.com/invite)/[\w-]+', _re.IGNORECASE)
+
+# user_id -> list of (timestamp, message, channel_id)
+_spam_tracker = defaultdict(list)
+_spam_warned = defaultdict(float)
+
+SPAM_WINDOW = 8          # seconds
+SPAM_MAX_MSGS = 6        # messages within window = flood
+SPAM_MENTION_LIMIT = 5   # unique mentions per message
+SPAM_WARN_COOLDOWN = 30  # don't re-warn same user within N seconds
+
+def _is_whitelisted_channel(channel_id: int) -> bool:
+    return False
+
+def _register_and_check_spam(user_id: int, content: str, mention_count: int, channel_id: int) -> str | None:
+    """Register a message; return 'flood' | 'mention' | None. Invite is checked separately."""
+    now = time.time()
+    bucket = _spam_tracker[user_id]
+    bucket[:] = [(t, m, c) for (t, m, c) in bucket if now - t <= SPAM_WINDOW]
+    bucket.append((now, content, channel_id))
+    if len(bucket) >= SPAM_MAX_MSGS:
+        bucket.clear()
+        return "flood"
+    if mention_count > SPAM_MENTION_LIMIT:
+        return "mention"
+    return None
+
+def _should_warn_spam(user_id: int) -> bool:
+    now = time.time()
+    if now - _spam_warned[user_id] < SPAM_WARN_COOLDOWN:
+        return False
+    _spam_warned[user_id] = now
+    return True
+
+async def _handle_spam_violation(pesan, violation: str) -> None:
+    """Warn + auto-timeout on repeat offense; delete message."""
+    member = pesan.author
+    try:
+        await pesan.delete()
+    except Exception:
+        pass
+    add_infraction(pesan.guild.id, member.id, pesan.guild.me.id, "SPAM", f"{violation} in #{pesan.channel.name}")
+    warns = count_infractions(pesan.guild.id, member.id, "SPAM")
+    try:
+        if warns >= 3:
+            until = discord.utils.utcnow() + timedelta(minutes=30)
+            await member.timeout(until, reason=f"Anti-spam: {warns} violations")
+            add_infraction(pesan.guild.id, member.id, pesan.guild.me.id, "AUTO-TIMEOUT", f"Anti-spam: {warns} violations")
+            note = f"🛑 **{member.mention}** kena timeout 30 menit (pelanggaran spam ke-{warns})."
+        elif _should_warn_spam(member.id):
+            note = f"⚠️ {member.mention} jangan spam bro ({violation}). Pelanggaran ke-{warns}/3."
+        else:
+            note = None
+        if note:
+            await pesan.channel.send(note, delete_after=10)
+    except Exception as e:
+        logger.error(f"Anti-spam enforcement error: {e}")
+
+# ============================================================
 #  DISCORD CLIENT SETUP
 # ============================================================
 
@@ -1604,6 +1667,21 @@ async def on_message(pesan):
         
         return
     
+    # ============================================================
+    #  ANTI-SPAM: flood / invite / mass-mention
+    # ============================================================
+    if cfg.get("automod_enabled", True) and pesan.guild and not is_moderator(pesan.author):
+        violation = None
+        if _INVITE_RE.search(pesan.content):
+            violation = "invite link"
+        else:
+            violation = _register_and_check_spam(
+                pesan.author.id, pesan.content, len(pesan.mentions), pesan.channel.id
+            )
+        if violation:
+            await _handle_spam_violation(pesan, violation)
+            return
+
     # ============================================================
     #  RATE LIMIT CHECK
     # ============================================================
