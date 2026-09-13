@@ -1190,8 +1190,15 @@ def init_db():
             user_id INTEGER NOT NULL,
             user_message TEXT NOT NULL,
             bot_response TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            channel_id INTEGER DEFAULT 0
         )''')
+        # Migration: tambah channel_id utk DB lama
+        try:
+            c.execute("SELECT channel_id FROM conversation LIMIT 1")
+        except sqlite3.OperationalError:
+            c.execute("ALTER TABLE conversation ADD COLUMN channel_id INTEGER DEFAULT 0")
+            logger.info("Migrated conversation table: added channel_id column")
         
         # Infraction table (warn, kick, ban, etc)
         c.execute('''CREATE TABLE IF NOT EXISTS infractions (
@@ -1213,14 +1220,14 @@ def init_db():
 # Initialize DB on module load so dashboard/Railway imports create tables automatically
 init_db()
 
-def save_conversation(user_id: int, user_msg: str, bot_response: str):
+def save_conversation(user_id: int, user_msg: str, bot_response: str, channel_id: int = 0):
     """Save conversation to database."""
     try:
         init_db() # Ensure db table exists
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute('INSERT INTO conversation (user_id, user_message, bot_response) VALUES (?, ?, ?)',
-                  (user_id, user_msg, bot_response))
+        c.execute('INSERT INTO conversation (user_id, user_message, bot_response, channel_id) VALUES (?, ?, ?, ?)',
+                  (user_id, user_msg, bot_response, channel_id))
         conn.commit()
         
         # Clean up old messages (keep only MAX_DB_MESSAGES per user)
@@ -1263,23 +1270,30 @@ def get_user_infractions(guild_id: int, user_id: int) -> list:
         logger.error(f"Error getting infractions: {e}")
         return []
 
-def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES) -> str:
-    """Get user conversation history (optimized)."""
+def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES, channel_id: int = 0) -> str:
+    """Get user conversation history. Prefers context from the same channel."""
     try:
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        # Fetch exact limit needed, not more
-        c.execute('''SELECT user_message, bot_response FROM conversation 
+        c.execute('''SELECT user_message, bot_response, channel_id FROM conversation 
                      WHERE user_id = ? ORDER BY id DESC LIMIT ?''',
-                  (user_id, limit))
+                  (user_id, limit * 4))
         rows = c.fetchall()
         conn.close()
         
         if not rows:
             return ""
         
+        # Prioritas: pesan di channel yang sama (terbaru dulu), fallback campuran
+        if channel_id:
+            same_channel = [(m, r) for (m, r, ch) in rows if ch == channel_id][:limit]
+        else:
+            same_channel = []
+        picked = same_channel if len(same_channel) >= 1 else [(m, r) for (m, r, ch) in rows[:limit]]
+        picked = picked[-limit:]  # urut kronologis
+        
         history = []
-        for user_msg, bot_resp in reversed(rows):
+        for user_msg, bot_resp in picked:
             history.append(f"User: {user_msg}\nBot: {bot_resp}")
         
         return "\n\n".join(history)
@@ -1347,7 +1361,7 @@ def fetch_trending_news() -> str:
 #  AI FUNCTIONS (MERGED & OPTIMIZED)
 # ============================================================
 
-async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trending: bool = False) -> str:
+async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trending: bool = False, channel_id: int = 0) -> str:
     """
     Send question to OpenRouter with optional trending news context.
     Merged function replacing both tanya_ai and tanya_ai_dengan_trending.
@@ -1361,7 +1375,7 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             berita = await asyncio.to_thread(fetch_trending_news)
             context_parts.append(f"Berita Trending Saat Ini:\n{berita}")
         
-        history = get_user_history(user_id)
+        history = get_user_history(user_id, channel_id=channel_id)
         if history:
             context_parts.append(f"Recent context:\n{history}")
         
@@ -1409,7 +1423,7 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
         balasan = hasil.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         
         if balasan:
-            save_conversation(user_id, pertanyaan, balasan)
+            save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
             logger.info(f"Response saved for user {user_id}")
             return balasan
         else:
@@ -1722,7 +1736,8 @@ async def on_message(pesan):
                 "Apa yang trending hari ini? Berikan penjelasan singkat tentang trending topics terkini.",
                 pesan.author.id,
                 pesan.author.name,
-                include_trending=True
+                include_trending=True,
+                channel_id=pesan.channel.id
             )
         
         jawaban = truncate_response(jawaban)
@@ -1837,7 +1852,7 @@ async def on_message(pesan):
         return
 
     async with pesan.channel.typing():
-        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=False)
+        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=False, channel_id=pesan.channel.id)
     
     jawaban = truncate_response(jawaban)
     
