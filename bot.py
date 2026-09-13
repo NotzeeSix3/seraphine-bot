@@ -91,7 +91,28 @@ def _make_ytdl(player_clients=None):
     return yt_dlp.YoutubeDL(opts)
 
 ytdl = _make_ytdl()
-ytdl = _make_ytdl()
+
+# --- Diagnostik runtime YouTube (Deno/EJS) — muncul di log Railway saat startup ---
+def _log_yt_diag():
+    import shutil as _sh, os as _os
+    deno = _sh.which("deno") or _os.path.exists("/usr/local/bin/deno")
+    ffmpeg = _sh.which("ffmpeg")
+    ytdl_log.info(f"[yt-diag] deno={deno} ffmpeg={ffmpeg} cookies={bool(COOKIES_FILE)}")
+    try:
+        import yt_dlp_ejs
+        ytdl_log.info(f"[yt-diag] yt-dlp-ejs OK v{getattr(yt_dlp_ejs, '__version__', '?')}")
+    except Exception as e:
+        ytdl_log.warning(f"[yt-diag] yt-dlp-ejs TIDAK ADA: {e}")
+    try:
+        from yt_dlp.globals import supported_js_runtimes
+        ytdl_log.info(f"[yt-diag] js_runtimes={list(supported_js_runtimes.value)}")
+    except Exception as e:
+        ytdl_log.warning(f"[yt-diag] js_runtimes info gagal: {e}")
+
+try:
+    _log_yt_diag()
+except Exception as _e:
+    pass
 
 # Urutan fallback player_client YouTube (Sep 2026): dari IP datacenter Railway,
 # client 'web' default & 'tv' selalu kena bot-check/403; yang terbukti paling
