@@ -97,6 +97,25 @@ def get_recent_logs(limit=50):
     except Exception as e:
         return [f"Error reading logs: {e}"]
 
+def get_music_queues():
+    """Live music queue snapshot from the shared bot module (same process)."""
+    if not BOT_IMPORT_SUCCESS:
+        return []
+    try:
+        import bot as _bot
+        out = []
+        for gid, queue in _bot.music_queues.items():
+            if queue:
+                out.append({
+                    "guild_id": gid,
+                    "loop": bool(_bot.music_loop.get(gid)),
+                    "tracks": [{"title": getattr(p, "title", "?"), "url": getattr(p, "url", "")} for p in queue[:10]],
+                })
+        return out
+    except Exception as e:
+        print("Music queue read error:", e)
+        return []
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en" class="dark">
@@ -266,6 +285,30 @@ HTML_TEMPLATE = """
                     </div>
                 </section>
 
+                <!-- Music Queues -->
+                <section id="music" class="bg-cardbg p-6 rounded-2xl border border-slate-800 shadow-xl">
+                    <h3 class="text-lg font-bold mb-4 flex items-center">🎵 Live Music Queues</h3>
+                    <div class="space-y-4">
+                        {% for q in music_queues %}
+                        <div class="bg-slate-900/50 rounded-xl border border-slate-800 p-4">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="font-mono text-xs text-slate-400">Guild {{ q.guild_id }}</span>
+                                <span class="px-2 py-1 rounded text-xs {% if q.loop %}bg-indigo-500/10 text-indigo-400 border border-indigo-500/20{% else %}bg-slate-700/30 text-slate-400 border border-slate-600/30{% endif %} font-semibold">
+                                    {% if q.loop %}🔁 Loop ON{% else %}Loop OFF{% endif %}
+                                </span>
+                            </div>
+                            <ol class="text-sm text-slate-300 space-y-1 list-decimal list-inside">
+                                {% for t in q.tracks %}
+                                <li>{% if t.url %}<a href="{{ t.url }}" class="hover:text-indigo-400 transition" target="_blank">{{ t.title }}</a>{% else %}{{ t.title }}{% endif %}</li>
+                                {% endfor %}
+                            </ol>
+                        </div>
+                        {% else %}
+                        <p class="text-slate-500 text-sm">No active music queues right now.</p>
+                        {% endfor %}
+                    </div>
+                </section>
+
                 <!-- Live Logs -->
                 <section id="logs" class="bg-cardbg p-6 rounded-2xl border border-slate-800 shadow-xl">
                     <div class="flex justify-between items-center mb-4">
@@ -291,14 +334,15 @@ async def index():
     stats = get_db_stats()
     infractions = get_recent_infractions()
     logs = get_recent_logs()
+    music_queues = get_music_queues()
     
-    return HTMLResponse(content=render_html(config, stats, infractions, logs))
+    return HTMLResponse(content=render_html(config, stats, infractions, logs, music_queues))
 
-def render_html(config, stats, infractions, logs):
+def render_html(config, stats, infractions, logs, music_queues=None):
     try:
         from jinja2 import Template
         t = Template(HTML_TEMPLATE)
-        return t.render(config=config, stats=stats, infractions=infractions, logs=logs)
+        return t.render(config=config, stats=stats, infractions=infractions, logs=logs, music_queues=music_queues or [])
     except Exception as e:
         return HTML_TEMPLATE.replace("{{ stats.conversations }}", str(stats["conversations"])).replace("{{ stats.infractions }}", str(stats["infractions"]))
 
