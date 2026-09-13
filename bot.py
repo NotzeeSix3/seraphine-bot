@@ -573,6 +573,168 @@ async def slash_vunmute(interaction: discord.Interaction, member: discord.Member
         await interaction.response.send_message(f"❌ Gagal melepas mute member: {e}", ephemeral=True)
 
 # ============================================================
+#  SLASH MODERATION + SERVER INFO COMMANDS
+# ============================================================
+
+async def _send_mod_log(guild: discord.Guild, embed: discord.Embed):
+    """Best-effort delivery of a moderation embed to the mod log channel."""
+    try:
+        channel = await get_or_create_mod_log_channel(guild)
+        if channel:
+            await channel.send(embed=embed)
+    except Exception as e:
+        logger.warning(f"Could not write to mod log: {e}")
+
+@tree.command(name="skick", description="Kick member dari server (Admin/Mod)")
+@app_commands.describe(member="Member yang mau di-kick", reason="Alasan kick")
+@app_commands.checks.has_permissions(kick_members=True)
+async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("❌ Gak bisa kick diri sendiri bro.", ephemeral=True)
+        return
+
+    if member.top_role >= interaction.guild.me.top_role:
+        await interaction.response.send_message("❌ Posisi role member lebih tinggi/sama dengan bot, gak bisa di-kick.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    success, msg = await kick_user(member, reason, moderator_id=interaction.user.id)
+
+    embed = discord.Embed(
+        title="🚪 Kick Action",
+        description=msg,
+        color=0xFF5733 if success else 0xFF0000,
+        timestamp=datetime.now()
+    )
+    embed.set_footer(text=f"Moderator: {interaction.user.name}")
+    await interaction.followup.send(embed=embed)
+
+    if success:
+        await _send_mod_log(interaction.guild, embed)
+
+@tree.command(name="sinfractions", description="Lihat riwayat moderasi member (Admin/Mod)")
+@app_commands.describe(member="Member yang mau dicek riwayatnya")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def slash_infractions(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    infractions = get_user_infractions(interaction.guild.id, member.id)
+
+    if not infractions:
+        embed = discord.Embed(
+            title="📋 User Infractions",
+            description=f"✅ {member.mention} belum punya riwayat pelanggaran.",
+            color=0x00FF00,
+            timestamp=datetime.now()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"📋 Infractions - {member.display_name}",
+        description=f"Total pelanggaran: **{len(infractions)}**",
+        color=0xFF5733,
+        timestamp=datetime.now()
+    )
+    if member.avatar:
+        embed.set_thumbnail(url=member.avatar.url)
+
+    for i, (action_type, reason, timestamp, mod_id) in enumerate(infractions[-10:], 1):
+        embed.add_field(
+            name=f"{i}. {action_type}",
+            value=f"**Alasan:** {reason}\n**Mod:** <@{mod_id}>\n**Tanggal:** {timestamp}",
+            inline=False
+        )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@tree.command(name="sannounce", description="Kirim pengumuman resmi ke channel (Admin)")
+@app_commands.describe(
+    title="Judul pengumuman",
+    message="Isi pengumuman",
+    role="Role yang mau di-mention (opsional)",
+    pin="Pin pesan pengumuman?"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_announce(
+    interaction: discord.Interaction,
+    title: str,
+    message: str,
+    role: discord.Role | None = None,
+    pin: bool = True
+):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send("❌ Command ini cuma bisa dipakai di text channel biasa.", ephemeral=True)
+        return
+
+    mention = role.mention if role else None
+    success, msg = await send_announcement(channel, title, message, mention_role=mention, pin=pin)
+
+    embed = discord.Embed(
+        title="📢 Announcement Posted" if success else "❌ Gagal Kirim",
+        description=msg,
+        color=0x2ECC71 if success else 0xFF0000,
+        timestamp=datetime.now()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+def build_help_embed() -> discord.Embed:
+    """Single source of truth for the help menu (prefix + slash)."""
+    embed = discord.Embed(
+        title="📚 Seraphine AI - Daftar Command",
+        color=0x7289DA,
+        timestamp=datetime.now()
+    )
+    embed.add_field(
+        name="💬 AI Chat",
+        value="`!<pertanyaan>` - Tanya apa aja\n`@Seraphine AI <pertanyaan>` - Mention bot",
+        inline=False
+    )
+    embed.add_field(
+        name="🎵 Musik (Slash)",
+        value="`/splay` - Putar dari YouTube\n`/squeue` - Lihat antrean\n`/sskip` - Lewati lagu\n"
+              "`/spause` - Pause / resume\n`/snowplaying` - Lagu yang lagi diputar\n`/sstop` - Stop & keluar VC",
+        inline=False
+    )
+    embed.add_field(
+        name="🔨 Moderasi (Admin/Mod)",
+        value="`/skick @member` - Kick member\n`/sinfractions @member` - Riwayat pelanggaran\n"
+              "`/vmute` `/vunmute` - Mute voice\n`/sannounce` - Kirim pengumuman",
+        inline=False
+    )
+    embed.add_field(
+        name="🖥️ Server Info (Admin)",
+        value="`!server-info` - Info server\n`!member-list` - Top 20 members\n"
+              "`!channel-list` - Daftar channel\n`!role-list` - Daftar role",
+        inline=False
+    )
+    embed.add_field(
+        name="ℹ️ Bot Info",
+        value=f"Dibuat oleh: **Notzee**\nNama: **Seraphine AI**\nModel: **{AI_MODEL}**",
+        inline=False
+    )
+    embed.set_footer(text="Ketik / untuk lihat semua slash command")
+    return embed
+
+@tree.command(name="shelp", description="Lihat daftar command Seraphine AI")
+async def slash_help(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_help_embed(), ephemeral=True)
+
+# ============================================================
 #  MUSIC SLASH COMMANDS
 # ============================================================
 
@@ -669,6 +831,53 @@ async def slash_skip(interaction: discord.Interaction):
     if voice_client and voice_client.is_playing():
         voice_client.stop()
         await interaction.response.send_message("⏭️ Lagu di-skip!")
+    else:
+        await interaction.response.send_message("❌ Gak ada lagu yang lagi diputar bro.", ephemeral=True)
+
+# ============================================================
+#  MUSIC STATE COMMANDS (pause / resume / nowplaying)
+# ============================================================
+
+@tree.command(name="spause", description="Pause lagu yang sedang diputar (Seraphine)")
+async def slash_pause(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing():
+        vc.pause()
+        await interaction.response.send_message("⏸️ Musik di-pause.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Gak ada lagu yang lagi diputar bro.", ephemeral=True)
+
+@tree.command(name="sresume", description="Lanjutkan lagu yang di-pause (Seraphine)")
+async def slash_resume(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if vc and vc.is_paused():
+        vc.resume()
+        await interaction.response.send_message("▶️ Musik dilanjutkan.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Gak ada musik yang lagi di-pause.", ephemeral=True)
+
+@tree.command(name="snowplaying", description="Lihat lagu yang lagi diputar (Seraphine)")
+async def slash_nowplaying(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing() and getattr(vc, "source", None) is not None:
+        src = vc.source
+        title = getattr(src, "title", None) or "Lagu saat ini"
+        url = getattr(src, "url", None) or ""
+        embed = discord.Embed(
+            title="🎶 Sekarang Diputar",
+            description=f"[{title}]({url})" if url else title,
+            color=0x7289DA
+        )
+        await interaction.response.send_message(embed=embed)
     else:
         await interaction.response.send_message("❌ Gak ada lagu yang lagi diputar bro.", ephemeral=True)
 
@@ -980,8 +1189,8 @@ async def kick_user(member: discord.Member, reason: str = "No reason provided", 
         logger.error(f"Error kicking user: {e}")
         return False, f"❌ Error kick user: {str(e)[:50]}"
 
-async def send_announcement(channel: discord.TextChannel, title: str, message: str, 
-                           mention_role: str = None, pin: bool = True) -> tuple[bool, str]:
+async def send_announcement(channel: discord.TextChannel, title: str, message: str,
+                           mention_role: str | None = None, pin: bool = True) -> tuple[bool, str]:
     """Send announcement to channel."""
     try:
         mention_text = ""
@@ -1071,7 +1280,7 @@ async def on_ready():
     
     # Set status
     await client.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.listening, name="!help")
+        activity=discord.Activity(type=discord.ActivityType.listening, name="/shelp")
     )
 
 @client.event
@@ -1203,50 +1412,7 @@ async def on_message(pesan):
     #  HELP COMMAND
     # ============================================================
     if command == "help":
-        embed = discord.Embed(
-            title="📚 Seraphine AI Bot - Command List",
-            color=0x7289da,
-            timestamp=datetime.now()
-        )
-        
-        embed.add_field(
-            name="💬 AI Chat",
-            value="`!<pertanyaan>` - Tanya apa aja\n`@Seraphine AI <pertanyaan>` - Mention bot",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="📰 News",
-            value="`!trending` - Lihat berita trending",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🎵 Music Commands (Slash Commands /)",
-            value="`/splay <judul>` - Putar musik dari YouTube\n`/squeue` - Lihat daftar antrean musik\n`/sskip` - Lewati lagu\n`/sstop` - Stop musik & keluar VC",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🔨 Moderation (Admin/Mod)",
-            value="`!kick @user reason` - Kick user dari server\n`!infractions @user` - Lihat history moderasi user\n`!announce [title] | [message]` - Send announcement",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🖥️ Server (Admin only)",
-            value="`!server-info` - Info server\n`!member-list` - Top 20 members\n`!channel-list` - Daftar channels\n`!role-list` - Daftar roles",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="ℹ️ Bot Info",
-            value=f"Dibuat oleh: **Notzee**\nNama: **Seraphine AI**\nModel: **GPT-3.5-Turbo**",
-            inline=False
-        )
-        
-        embed.set_footer(text="Ketik !help lagi untuk lihat command ini")
-        await pesan.reply(embed=embed)
+        await pesan.reply(embed=build_help_embed())
         return
     
     # ============================================================
@@ -1356,142 +1522,14 @@ async def on_message(pesan):
         return
     
     # ============================================================
-    #  KICK COMMAND
+    #  PREFIX REDIRECT: musik & moderasi sekarang slash-only
     # ============================================================
-    if command == "kick":
-        member = pesan.guild.get_member(pesan.author.id)
-        if not is_moderator(member):
-            await pesan.reply("❌ Hanya moderator/admin yang bisa kick!")
-            return
-        
-        try:
-            # Parse: !kick @user reason
-            parts = pertanyaan.split()
-            if len(parts) < 2:
-                await pesan.reply("❌ Format: `!kick @user reason`")
-                return
-            
-            # Get mentioned user
-            if pesan.mentions:
-                target = pesan.mentions[0]
-                reason = " ".join(parts[2:]) if len(parts) > 2 else "No reason"
-            else:
-                await pesan.reply("❌ Mention user yang mau di-kick!")
-                return
-            
-            target_member = pesan.guild.get_member(target.id)
-            if not target_member:
-                await pesan.reply("❌ User tidak ditemukan!")
-                return
-            
-            success, msg = await kick_user(target_member, reason, moderator_id=pesan.author.id)
-            
-            embed = discord.Embed(
-                title="🚪 Kick Action",
-                description=msg,
-                color=0xFF5733 if success else 0xFF0000,
-                timestamp=datetime.now()
-            )
-            await pesan.reply(embed=embed)
-        except Exception as e:
-            logger.error(f"Error in kick command: {e}")
-            await pesan.reply(f"❌ Error: {str(e)[:50]}")
-        return
-    
-    # ============================================================
-    #  INFRACTIONS COMMAND (lihat history moderasi user)
-    # ============================================================
-    if command == "infractions":
-        try:
-            # Parse: !infractions @user
-            if not pesan.mentions:
-                await pesan.reply("❌ Format: `!infractions @user`")
-                return
-            
-            target = pesan.mentions[0]
-            infractions = get_user_infractions(pesan.guild.id, target.id)
-            
-            if not infractions:
-                embed = discord.Embed(
-                    title="📋 User Infractions",
-                    description=f"✅ {target.name} tidak punya infraction history",
-                    color=0x00ff00,
-                    timestamp=datetime.now()
-                )
-                await pesan.reply(embed=embed)
-                return
-            
-            embed = discord.Embed(
-                title=f"📋 Infractions - {target.name}#{target.discriminator}",
-                description=f"Total infractions: **{len(infractions)}**",
-                color=0xFF5733,
-                timestamp=datetime.now()
-            )
-            
-            embed.set_thumbnail(url=target.avatar.url if target.avatar else None)
-            
-            for i, (action_type, reason, timestamp, mod_id) in enumerate(infractions[-10:], 1):  # Last 10
-                embed.add_field(
-                    name=f"{i}. {action_type}",
-                    value=f"**Reason:** {reason}\n**Mod:** <@{mod_id}>\n**Date:** {timestamp}",
-                    inline=False
-                )
-            
-            await pesan.reply(embed=embed)
-        except Exception as e:
-            logger.error(f"Error in infractions command: {e}")
-            await pesan.reply(f"❌ Error: {str(e)[:50]}")
-        return
-    
-    # ============================================================
-    #  ANNOUNCE COMMAND
-    # ============================================================
-    if command == "announce":
-        # Check permission directly from message (more reliable)
-        if not pesan.author.guild_permissions.administrator and pesan.author.id != pesan.guild.owner_id:
-            await pesan.reply("❌ Hanya admin yang bisa pakai command ini")
-            logger.warning(f"User {pesan.author.name} tried announce without permission")
-            return
-        
-        try:
-            # Parse: !announce [title] | [message] | [mention:@role]
-            rest = pertanyaan[len("announce"):].strip()
-            
-            if not rest:
-                await pesan.reply("❌ Format: `!announce [title] | [message]`\nContoh: `!announce Maintenance | Server update malam ini`")
-                return
-            
-            parts = rest.split("|")
-            title = parts[0].strip() if len(parts) > 0 else "Announcement"
-            message = parts[1].strip() if len(parts) > 1 else "No message"
-            mention = parts[2].strip() if len(parts) > 2 else None
-            
-            success, msg = await send_announcement(
-                pesan.channel, 
-                title, 
-                message, 
-                mention_role=mention,
-                pin=True
-            )
-            
-            embed = discord.Embed(
-                title="📢 Announcement Posted",
-                description=msg,
-                color=0xFF5733 if success else 0xFF0000,
-                timestamp=datetime.now()
-            )
-            await pesan.reply(embed=embed)
-            logger.info(f"Announcement posted by {pesan.author.name}")
-        except Exception as e:
-            logger.error(f"Error in announce command: {e}")
-            await pesan.reply(f"❌ Error: {str(e)[:50]}")
-        return
-    
-    # ============================================================
-    #  MUSIC COMMANDS (REDIRECT KE SLASH COMMAND)
-    # ============================================================
-    if command in ["play", "splay", "queue", "squeue", "skip", "sskip", "stop", "sstop"]:
+    if command in ["play", "splay", "queue", "squeue", "skip", "sskip", "stop", "sstop", "pause", "spause", "resume", "sresume", "nowplaying", "snowplaying"]:
         await pesan.reply("🎵 Command musik sekarang pakai **Slash Command (`/`)** khusus Seraphine bro! Coba ketik `/splay`, `/squeue`, `/sskip`, atau `/sstop` 😉")
+        return
+
+    if command in ["kick", "infractions", "announce"]:
+        await pesan.reply("🔨 Command moderasi sekarang pakai **Slash Command (`/`)** bro! Coba ketik `/skick`, `/sinfractions`, atau `/sannounce` 😉")
         return
 
     # ============================================================
