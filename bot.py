@@ -376,6 +376,118 @@ def resolve_spotify_query(query: str) -> tuple[list[str], str]:
     return [queries[0]], f"Spotify search: {keyword}"
 
 
+# ---- Fallback tanpa Web API (buat app Development yang gak punya Premium) ----
+# Spotify Web API sekarang butuh akun owner Premium ("Active premium
+# subscription required for the owner of the app"). Kalau API diblokir,
+# kita baca metadata dari HALAMAN EMBED publik Spotify
+# (open.spotify.com/embed/<type>/<id>) yang menyertakan JSON __NEXT_DATA__
+# berisi nama track + artist + trackList, TANPA butuh token/Premium.
+# Audionya tetap diputar lewat YouTube search (yt-dlp).
+
+_SPOTIFY_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+
+
+def _spotify_embed_entity(kind: str, sid: str) -> dict | None:
+    """Ambil objek entity dari __NEXT_DATA__ halaman embed publik Spotify."""
+    try:
+        import json as _json
+        r = requests.get(
+            f"https://open.spotify.com/embed/{kind}/{sid}",
+            headers={"User-Agent": _SPOTIFY_UA},
+            timeout=15,
+        )
+        r.raise_for_status()
+        m = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            r.text, re.S,
+        )
+        if not m:
+            return None
+        data = _json.loads(m.group(1))
+        return (data.get("props", {})
+                    .get("pageProps", {})
+                    .get("state", {})
+                    .get("data", {})
+                    .get("entity"))
+    except Exception as e:
+        ytdl_log.warning(f"Spotify embed gagal ({kind}/{sid}): {e}")
+        return None
+
+
+def _spotify_scrape_track(url: str) -> tuple[str | None, str | None]:
+    """Ambil (query 'Artist - Judul', label) dari halaman embed Spotify."""
+    m = _SPOTIFY_URL_RE.search(url or "")
+    if not m:
+        return None, None
+    kind, sid = m.group(1), m.group(2)
+    ent = _spotify_embed_entity("track" if kind == "track" else kind, sid)
+    if not ent:
+        return None, None
+    name = (ent.get("name") or ent.get("title") or "").strip()
+    artists = ", ".join(
+        a.get("name", "") for a in (ent.get("artists") or []) if a.get("name")
+    )
+    if not name:
+        return None, None
+    q = f"{artists} - {name}".strip(" -") if artists else name
+    return q, f"Spotify (embed): {name}"
+
+
+def _spotify_scrape_list(url: str, max_items: int = 50) -> list[str]:
+    """Ambil daftar lagu dari halaman embed album/playlist Spotify."""
+    m = _SPOTIFY_URL_RE.search(url or "")
+    if not m:
+        return []
+    kind, sid = m.group(1), m.group(2)
+    ent = _spotify_embed_entity(kind, sid)
+    if not ent:
+        return []
+    queries: list[str] = []
+    for t in (ent.get("trackList") or []):
+        title = (t.get("title") or "").replace("\xa0", " ").strip()
+        if not title:
+            continue
+        sub = (t.get("subtitle") or "").replace("\xa0", " ").strip()  # biasanya nama artist
+        q = f"{sub} - {title}".strip(" -") if sub else title
+        if q not in queries:
+            queries.append(q)
+        if len(queries) >= max_items:
+            break
+    return queries
+
+
+def resolve_spotify_scrape(query: str) -> tuple[list[str], str]:
+    """Fallback resolver tanpa Web API. Raises Exception kalau gagal total."""
+    m = _SPOTIFY_URL_RE.search(query or "")
+    if m:
+        kind, _sid = m.group(1), m.group(2)
+        url = "https://open.spotify.com/" + m.group(0).split("open.spotify.com/")[-1]
+        if kind == "track":
+            q, label = _spotify_scrape_track(url)
+            if not q:
+                raise Exception(
+                    "Gagal baca metadata Spotify. Coba pakai judul lagu / link YouTube."
+                )
+            return [q], label or "Spotify track (embed)"
+        # album / playlist
+        queries = _spotify_scrape_list(url)
+        if queries:
+            return queries, f"Spotify {kind} (embed): {len(queries)} lagu"
+        q, label = _spotify_scrape_track(url)
+        if q:
+            return [q], label or "Spotify track (embed)"
+        raise Exception(
+            f"Gagal baca {kind} Spotify. Coba share link satu track, "
+            "atau pakai judul lagu / YouTube."
+        )
+    # query 'spotify: ...' -> gak bisa tanpa API, suruh pakai judul biasa
+    keyword = re.sub(r"(?i)^\s*spotify\s*:\s*", "", query or "").strip()
+    if keyword:
+        return [f"{keyword} audio"], "YouTube search (Spotify API nonaktif)"
+    raise Exception("Kasih judul lagu / link Spotify, atau langsung judul biasa.")
+
+
 class MusicControlView(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=None)
@@ -1173,22 +1285,38 @@ async def slash_play(interaction: discord.Interaction, query: str):
         # --- Spotify detect: link open.spotify.com / awalan 'spotify:' ---
         spotify_label = None
         spotify_queries: list[str] = [query]
-        if _is_spotify_url(query) or re.match(r"(?i)^\s*spotify\s*:", query or ""):
-            if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-                await interaction.followup.send(
-                    "❌ Fitur Spotify belum dikonfigurasi bro! Notzee harus isi "
-                    "`SPOTIFY_CLIENT_ID` & `SPOTIFY_CLIENT_SECRET` di Railway Variables dulu. "
-                    "(Bikin gratis di developer.spotify.com/dashboard)",
-                    ephemeral=True,
-                )
-                return
-            try:
-                spotify_queries, spotify_label = await client.loop.run_in_executor(
+        if _is_spotify_url(query) or re.match(r"(?i)^\s*spotify\s*:\s*", query or ""):
+            # Coba Web API dulu (kalau kredensial ada). Kalau gagal / gak ada
+            # kredensial (atau owner app belum Premium -> 403), fallback ke
+            # scrape halaman publik Spotify. YouTube tetap jadi sumber audio.
+            async def _try_api():
+                return await client.loop.run_in_executor(
                     None, resolve_spotify_query, query
                 )
-            except Exception as e:
-                await interaction.followup.send(f"❌ Spotify gagal: {e}", ephemeral=True)
-                return
+
+            async def _try_scrape():
+                return await client.loop.run_in_executor(
+                    None, resolve_spotify_scrape, query
+                )
+
+            resolved = False
+            if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+                try:
+                    spotify_queries, spotify_label = await _try_api()
+                    resolved = True
+                except Exception as e:
+                    ytdl_log.warning(f"Spotify API gagal, fallback scrape: {e}")
+            if not resolved:
+                try:
+                    spotify_queries, spotify_label = await _try_scrape()
+                    resolved = True
+                except Exception as e:
+                    await interaction.followup.send(
+                        f"❌ Spotify gagal: {e}\n"
+                        "💡 Tips: kirim judul lagu biasa, atau link YouTube.",
+                        ephemeral=True,
+                    )
+                    return
 
         first_spotify_note = spotify_label  # ditempel di embed lagu pertama
 
