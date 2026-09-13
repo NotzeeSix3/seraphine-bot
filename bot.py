@@ -104,7 +104,8 @@ _YTDL_FALLBACK_CLIENTS = [
     ['tv_embedded'],
     ['tv'],
     ['mweb'],
-    [None],  # default (web) — terakhir karena URL-nya sering 403 walau ekstraksi sukses
+    None,  # default (web) — jangan [None]! player_client=[None] bikin
+           # yt-dlp crash 'NoneType' object has no attribute 'lower'
 ]
 
 _BOT_CHECK_MARKERS = (
@@ -136,10 +137,16 @@ def _probe_stream_url(url):
 def _extract_info_with_fallback(url, download):
     """extract_info dengan retry pakai player_client alternatif kalau kena bot-check
     YouTube ATAU URL stream-nya ditolak (403) saat mau di-download/stream ffmpeg."""
-    attempts = [None] + _YTDL_FALLBACK_CLIENTS
+    attempts = list(_YTDL_FALLBACK_CLIENTS)
     last_err = None
     for clients in attempts:
-        extractor = ytdl if clients is None else _make_ytdl(clients)
+        if clients is None:
+            extractor = ytdl
+        else:
+            # Sanitasi: buang entri None di dalam list player_client,
+            # karena yt-dlp crash ('NoneType'.lower()) kalau dapat None.
+            clients = [c for c in clients if c] or None
+            extractor = ytdl if clients is None else _make_ytdl(clients)
         try:
             data = extractor.extract_info(url, download=download)
             if data and not download and 'entries' not in data:
@@ -186,6 +193,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         try:
             data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(url, download=False))
+            if not data:
+                raise Exception("YouTube extraction kosong (data None)")
             if 'entries' in data:
                 data = data['entries'][0]
                 if not data.get('url'):
