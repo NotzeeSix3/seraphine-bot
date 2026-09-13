@@ -216,13 +216,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
             data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(url, download=False))
             if not data:
                 raise Exception("YouTube extraction kosong (data None)")
-            if 'entries' in data:
+            if data.get('entries'):
                 data = data['entries'][0]
                 if not data.get('url'):
                     video_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
                     data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(video_url, download=False))
-                    if 'entries' in data:
+                    if data and data.get('entries'):
                         data = data['entries'][0]
+            elif 'entries' in data:
+                raise Exception("Tidak ada hasil pencarian di YouTube.")
             filename = data.get('url')
             if not filename:
                 raise Exception("No stream URL")
@@ -231,10 +233,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
             data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(url, download=True))
             if not data:
                 raise Exception("YouTube extraction kosong total (semua player_client gagal) — cek YOUTUBE_COOKIES / koneksi")
-            if 'entries' in data:
+            if data.get('entries'):
                 data = data['entries'][0]
-            if not data:
-                raise Exception("YouTube extraction kosong (entries kosong)")
+            if not data or not isinstance(data, dict):
+                raise Exception("YouTube extraction kosong / hasil pencarian tidak ditemukan")
             filename = ytdl.prepare_filename(data)
 
         if not filename:
@@ -575,12 +577,12 @@ async def _autoplay_next(guild_id, voice_client, channel):
         search_query = f"ytsearch1:{query}"
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(search_query, download=False))
-        if 'entries' in data:
+        if data and data.get('entries'):
             data = data['entries'][0]
             if not data.get('url'):
                 video_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
                 data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(video_url, download=False))
-                if 'entries' in data:
+                if data and data.get('entries'):
                     data = data['entries'][0]
         
         webpage_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
@@ -1349,11 +1351,18 @@ async def slash_play(interaction: discord.Interaction, query: str):
                     return
 
         first_spotify_note = spotify_label  # ditempel di embed lagu pertama
+        successful_tracks = 0
 
         for idx, yt_query in enumerate(spotify_queries):
-            player = await YTDLSource.from_url(yt_query, loop=client.loop, stream=True)
+            try:
+                player = await YTDLSource.from_url(yt_query, loop=client.loop, stream=True)
+            except Exception as e:
+                ytdl_log.warning(f"Gagal extract lagu ({yt_query}): {e}")
+                continue
 
-            if idx == 0 and not voice_client.is_playing():
+            successful_tracks += 1
+
+            if successful_tracks == 1 and not voice_client.is_playing():
                 voice_client._last_source = player
                 voice_client.play(player, after=lambda e: play_next(interaction.guild.id, voice_client, interaction.channel))
                 embed = discord.Embed(
@@ -1371,18 +1380,23 @@ async def slash_play(interaction: discord.Interaction, query: str):
                     await interaction.channel.send(embed=embed, view=view)
             else:
                 music_queues[interaction.guild.id].append(player)
-                if idx == 0:
+                if successful_tracks == 1:
                     msg = f"✅ Menambahkan ke antrean: **{player.title}** (Urutan ke-{len(music_queues[interaction.guild.id])})"
                     try:
                         await interaction.followup.send(msg)
                     except:
                         await interaction.channel.send(msg)
+
+        if successful_tracks == 0:
+            await interaction.followup.send("❌ Gagal memutar lagu dari Spotify/YouTube (semua lagu tidak ditemukan).", ephemeral=True)
+            return
+
         # Kabari kalau playlist/album Spotify masuk antrean banyak
         if spotify_label and len(spotify_queries) > 1:
             try:
                 await interaction.channel.send(
-                    f"✅ **{spotify_label}** masuk antrean bro! Lagu pertama langsung diputar, "
-                    f"sisanya ({len(spotify_queries) - 1}) nyusul di queue. Cek `/squeue` 😉"
+                    f"✅ **{spotify_label}** masuk antrean bro! {successful_tracks} lagu berhasil dimuat. "
+                    f"Cek `/squeue` 😉"
                 )
             except:
                 pass
