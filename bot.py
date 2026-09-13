@@ -24,7 +24,7 @@ os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ["PATH"] += os.pathsep + os.getcwd()
 import asyncio
 import yt_dlp
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from collections import defaultdict
 import time
@@ -654,6 +654,166 @@ async def slash_infractions(interaction: discord.Interaction, member: discord.Me
         )
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ============================================================
+#  WARN / TIMEOUT / BAN + AUTO-ESCALATION
+# ============================================================
+
+def count_infractions(guild_id: int, user_id: int, action_type: str = "WARN") -> int:
+    """Count infractions of a given type for a user in a guild."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('''SELECT COUNT(*) FROM infractions
+                     WHERE guild_id = ? AND user_id = ? AND action_type = ?''',
+                  (guild_id, user_id, action_type))
+        n = c.fetchone()[0]
+        conn.close()
+        return n
+    except Exception as e:
+        logger.error(f"Error counting infractions: {e}")
+        return 0
+
+async def _auto_escalate(interaction: discord.Interaction, member: discord.Member, reason: str):
+    """3 warns = 1 hour timeout, 6 warns = kick. Returns escalation note or None."""
+    warns = count_infractions(interaction.guild.id, member.id, "WARN")
+    if warns >= 6 and not member.bot:
+        success, msg = await kick_user(member, f"Auto-escalation: {warns} warnings", moderator_id=interaction.user.id)
+        return f"⚠️ **Auto-escalation:** {warns} warn tercapai — member di-kick. {msg}"
+    if warns >= 3:
+        try:
+            until = discord.utils.utcnow() + timedelta(hours=1)
+            await member.timeout(until, reason=f"Auto-escalation: {warns} warnings")
+            add_infraction(interaction.guild.id, member.id, interaction.user.id, "AUTO-TIMEOUT", f"Auto-escalation: {warns} warnings | {reason}")
+            return f"⚠️ **Auto-escalation:** {warns} warn tercapai — member di-timeout 1 jam."
+        except Exception as e:
+            logger.error(f"Auto-escalation timeout failed: {e}")
+            return f"⚠️ Auto-escalation gagal eksekusi timeout: {str(e)[:60]}"
+    return None
+
+@tree.command(name="swarn", description="Beri warning ke member (Admin/Mod)")
+@app_commands.describe(member="Member yang mau di-warn", reason="Alasan warning")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def slash_warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("❌ Gak bisa warn diri sendiri bro.", ephemeral=True)
+        return
+    if member.bot:
+        await interaction.response.send_message("❌ Gak bisa warn bot bro.", ephemeral=True)
+        return
+
+    add_infraction(interaction.guild.id, member.id, interaction.user.id, "WARN", reason)
+    escalation = await _auto_escalate(interaction, member, reason)
+
+    warns = count_infractions(interaction.guild.id, member.id, "WARN")
+    embed = discord.Embed(
+        title="⚠️ Warning",
+        description=f"**{member.mention}** di-warn.\n📝 **Alasan:** {reason}\n📊 **Total warn:** {warns}/6",
+        color=0xFFA500,
+        timestamp=datetime.now()
+    )
+    if escalation:
+        embed.add_field(name="Auto-Escalation", value=escalation, inline=False)
+    embed.set_footer(text=f"Moderator: {interaction.user.name}")
+    await interaction.response.send_message(embed=embed)
+    await _send_mod_log(interaction.guild, embed)
+
+@tree.command(name="stimeout", description="Timeout member (Admin/Mod)")
+@app_commands.describe(member="Member yang mau di-timeout", minutes="Durasi timeout (menit)", reason="Alasan timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def slash_timeout(interaction: discord.Interaction, member: discord.Member, minutes: int = 10, reason: str = "No reason provided"):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("❌ Gak bisa timeout diri sendiri bro.", ephemeral=True)
+        return
+    if not 1 <= minutes <= 40320:
+        await interaction.response.send_message("❌ Durasi 1 - 40320 menit (28 hari max).", ephemeral=True)
+        return
+
+    try:
+        until = discord.utils.utcnow() + timedelta(minutes=minutes)
+        await member.timeout(until, reason=reason)
+        add_infraction(interaction.guild.id, member.id, interaction.user.id, "TIMEOUT", f"{minutes}m | {reason}")
+        embed = discord.Embed(
+            title="🔇 Timeout",
+            description=f"**{member.mention}** di-timeout **{minutes} menit**.\n📝 **Alasan:** {reason}",
+            color=0xFF5733,
+            timestamp=datetime.now()
+        )
+        embed.set_footer(text=f"Moderator: {interaction.user.name}")
+        await interaction.response.send_message(embed=embed)
+        await _send_mod_log(interaction.guild, embed)
+    except Exception as e:
+        logger.error(f"Timeout error: {e}")
+        await interaction.response.send_message(f"❌ Gagal timeout: {str(e)[:80]}", ephemeral=True)
+
+@tree.command(name="sban", description="Ban member dari server (Admin)")
+@app_commands.describe(member="Member yang mau di-ban", reason="Alasan ban", delete_days="Hapus riwayat pesan (0-7 hari)")
+@app_commands.checks.has_permissions(ban_members=True)
+async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided", delete_days: int = 0):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("❌ Gak bisa ban diri sendiri bro.", ephemeral=True)
+        return
+    if member.top_role >= interaction.guild.me.top_role:
+        await interaction.response.send_message("❌ Posisi role member lebih tinggi/sama dengan bot.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        await member.ban(reason=reason, delete_message_days=max(0, min(7, delete_days)))
+        add_infraction(interaction.guild.id, member.id, interaction.user.id, "BAN", reason)
+        embed = discord.Embed(
+            title="🔨 Ban",
+            description=f"**{member.mention}** di-ban.\n📝 **Alasan:** {reason}",
+            color=0xFF0000,
+            timestamp=datetime.now()
+        )
+        embed.set_footer(text=f"Moderator: {interaction.user.name}")
+        await interaction.followup.send(embed=embed)
+        await _send_mod_log(interaction.guild, embed)
+    except Exception as e:
+        logger.error(f"Ban error: {e}")
+        await interaction.followup.send(f"❌ Gagal ban: {str(e)[:80]}", ephemeral=True)
+
+@tree.command(name="sunban", description="Unban user by ID (Admin)")
+@app_commands.describe(user_id="ID user yang mau di-unban", reason="Alasan unban")
+@app_commands.checks.has_permissions(ban_members=True)
+async def slash_unban(interaction: discord.Interaction, user_id: str, reason: str = "No reason provided"):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Command ini cuma bisa dipakai di server bro!", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        bans = [b async for b in interaction.guild.bans()]
+        target_entry = next((b for b in bans if b.user.id == int(user_id)), None)
+        if not target_entry:
+            await interaction.followup.send("❌ User gak ada di daftar ban.", ephemeral=True)
+            return
+        await interaction.guild.unban(target_entry.user, reason=reason)
+        add_infraction(interaction.guild.id, int(user_id), interaction.user.id, "UNBAN", reason)
+        uname = target_entry.user.name if hasattr(target_entry.user, "name") else str(target_entry.user)
+        embed = discord.Embed(
+            title="🔓 Unban",
+            description=f"**{uname}** (`{user_id}`) di-unban.\n📝 **Alasan:** {reason}",
+            color=0x2ECC71,
+            timestamp=datetime.now()
+        )
+        embed.set_footer(text=f"Moderator: {interaction.user.name}")
+        await interaction.followup.send(embed=embed)
+    except ValueError:
+        await interaction.followup.send("❌ user_id harus angka snowflake Discord.", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Unban error: {e}")
+        await interaction.followup.send(f"❌ Gagal unban: {str(e)[:80]}", ephemeral=True)
 
 @tree.command(name="sannounce", description="Kirim pengumuman resmi ke channel (Admin)")
 @app_commands.describe(
