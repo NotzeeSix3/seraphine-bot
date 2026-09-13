@@ -15,8 +15,10 @@ from discord import app_commands
 import requests
 import sqlite3
 import logging
+import json
 import os
 import random
+import re
 import ssl
 import certifi
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -234,6 +236,146 @@ def _translate_music_error(e: Exception) -> str:
     return f"❌ Gagal putar musik: {str(e)[:120]}"
 
 
+# ============================================================
+#  SPOTIFY SUPPORT (resolve Spotify URL -> YouTube search query)
+#  Spotify audio tidak bisa di-stream langsung tanpa premium
+#  device, jadi strateginya: ambil metadata lagu via Spotify
+#  Web API (Client Credentials Flow, tanpa login user), lalu
+#  putar audionya lewat YouTube search (yt-dlp yang sudah ada).
+# ============================================================
+
+_SPOTIFY_TOKEN_CACHE = {"token": None, "expires_at": 0.0}
+
+_SPOTIFY_URL_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z-]+/)?(track|album|playlist|artist)/([A-Za-z0-9]+)"
+)
+
+
+def _is_spotify_url(query: str) -> bool:
+    return bool(query and "open.spotify.com" in query and _SPOTIFY_URL_RE.search(query))
+
+
+def _spotify_get_token() -> str | None:
+    """Ambil access token Spotify via Client Credentials Flow (cache sampai expired)."""
+    import time as _time
+    import base64 as _b64
+    now = _time.time()
+    if _SPOTIFY_TOKEN_CACHE["token"] and now < _SPOTIFY_TOKEN_CACHE["expires_at"] - 60:
+        return _SPOTIFY_TOKEN_CACHE["token"]
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    try:
+        creds = _b64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+        r = requests.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {creds}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "client_credentials"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        _SPOTIFY_TOKEN_CACHE["token"] = payload.get("access_token")
+        _SPOTIFY_TOKEN_CACHE["expires_at"] = now + float(payload.get("expires_in", 3600))
+        return _SPOTIFY_TOKEN_CACHE["token"]
+    except Exception as e:
+        ytdl_log.warning(f"Spotify token gagal: {e}")
+        return None
+
+
+def _spotify_api(path: str, params: dict | None = None) -> dict | None:
+    token = _spotify_get_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(
+            f"https://api.spotify.com/v1{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params or {},
+            timeout=15,
+        )
+        if r.status_code == 401:  # token basi, refresh sekali
+            _SPOTIFY_TOKEN_CACHE["token"] = None
+            token = _spotify_get_token()
+            if not token:
+                return None
+            r = requests.get(
+                f"https://api.spotify.com/v1{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params or {},
+                timeout=15,
+            )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        ytdl_log.warning(f"Spotify API {path} gagal: {e}")
+        return None
+
+
+def _track_to_query(track: dict) -> str | None:
+    """Ubah objek track Spotify jadi query 'Artist - Judul' buat YouTube search."""
+    if not track:
+        return None
+    name = (track.get("name") or "").strip()
+    artists = ", ".join(a.get("name", "") for a in (track.get("artists") or []) if a.get("name"))
+    if not name:
+        return None
+    return f"{artists} - {name}".strip(" -") if artists else name
+
+
+def resolve_spotify_query(query: str) -> tuple[list[str], str]:
+    """Resolve input Spotify jadi list query YouTube + label sumber.
+
+    Returns: (queries, label). queries = list 'Artist - Judul'.
+    Raises Exception dengan pesan user-friendly kalau gagal.
+    """
+    m = _SPOTIFY_URL_RE.search(query or "")
+    if m:
+        kind, sid = m.group(1), m.group(2)
+        if kind == "track":
+            data = _spotify_api(f"/tracks/{sid}")
+            q = _track_to_query(data or {})
+            if not q:
+                raise Exception("Gagal ambil info lagu Spotify (cek SPOTIFY_CLIENT_ID/SECRET).")
+            title = (data or {}).get("name", "lagu Spotify")
+            return [q], f"Spotify track: {title}"
+        if kind == "playlist":
+            # Ambil sampai 50 lagu pertama (batas wajar buat antrean bot)
+            data = _spotify_api(f"/playlists/{sid}/tracks", {"limit": 50, "fields": "items(track(name,artists(name)))"})
+            items = (data or {}).get("items", [])
+            queries = [q for t in items if (q := _track_to_query((t or {}).get("track") or {}))]
+            if not queries:
+                raise Exception("Playlist Spotify kosong / tidak bisa dibaca (pastikan public).")
+            pname = (_spotify_api(f"/playlists/{sid}", {"fields": "name"}) or {}).get("name", "playlist")
+            return queries, f"Spotify playlist: {pname} ({len(queries)} lagu)"
+        if kind == "album":
+            data = _spotify_api(f"/albums/{sid}/tracks", {"limit": 50})
+            items = (data or {}).get("items", [])
+            # Track album tidak bawa full artist, fallback ke nama album artist
+            album = _spotify_api(f"/albums/{sid}", {"fields": "name,artists(name)"}) or {}
+            artist = ", ".join(a.get("name", "") for a in album.get("artists", []))
+            queries = []
+            for t in items or []:
+                t = t or {}
+                nm = (t.get("name") or "").strip()
+                if nm:
+                    queries.append(f"{artist} - {nm}".strip(" -") if artist else nm)
+            if not queries:
+                raise Exception("Album Spotify tidak bisa dibaca.")
+            return queries, f"Spotify album: {album.get('name', 'album')} ({len(queries)} lagu)"
+        raise Exception("Link artist Spotify belum didukung — pakai link track/playlist/album ya.")
+    # Bukan URL tapi query 'spotify: ...' -> cari via Spotify Search API
+    keyword = re.sub(r"(?i)^\s*spotify\s*:\s*", "", query or "").strip()
+    if not keyword:
+        raise Exception("Kasih judul lagu setelah 'spotify:' ya, contoh: spotify: rewrite the stars.")
+    data = _spotify_api("/search", {"q": keyword, "type": "track", "limit": 5})
+    items = ((data or {}).get("tracks") or {}).get("items", [])
+    queries = [q for t in items if (q := _track_to_query(t or {}))]
+    if not queries:
+        raise Exception("Spotify search ga nemu hasil — coba kata kunci lain.")
+    return [queries[0]], f"Spotify search: {keyword}"
+
+
 class MusicControlView(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=None)
@@ -375,6 +517,8 @@ def load_bot_config():
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "").strip()
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 MOD_LOG_CHANNEL_NAME = os.getenv("MOD_LOG_CHANNEL", "moderator-only").strip()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -961,7 +1105,7 @@ def build_help_embed() -> discord.Embed:
     )
     embed.add_field(
         name="🎵 Musik (Slash)",
-        value="`/splay` - Putar dari YouTube\n`/squeue` - Lihat antrean\n`/sskip` - Lewati lagu\n"
+        value="`/splay` - Putar dari YouTube / Spotify\n`/squeue` - Lihat antrean\n`/sskip` - Lewati lagu\n"
               "`/spause` - Pause\n`/sresume` - Resume\n`/sloop` - Loop lagu\n`/sshuffle` - Acak antrean\n"
               "`/snowplaying` - Lagu yang lagi diputar\n`/sstop` - Stop & keluar VC",
         inline=False
@@ -994,8 +1138,8 @@ async def slash_help(interaction: discord.Interaction):
 #  MUSIC SLASH COMMANDS
 # ============================================================
 
-@tree.command(name="splay", description="Putar musik dari YouTube (Seraphine)")
-@app_commands.describe(query="Judul lagu atau URL YouTube")
+@tree.command(name="splay", description="Putar musik dari YouTube / Spotify (Seraphine)")
+@app_commands.describe(query="Judul lagu, URL YouTube, atau link Spotify")
 async def slash_play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
@@ -1026,28 +1170,64 @@ async def slash_play(interaction: discord.Interaction, query: str):
                     pass
             voice_client = await member.voice.channel.connect()
 
-        player = await YTDLSource.from_url(query, loop=client.loop, stream=True)
-        
-        if not voice_client.is_playing():
-            voice_client._last_source = player
-            voice_client.play(player, after=lambda e: play_next(interaction.guild.id, voice_client, interaction.channel))
-            embed = discord.Embed(
-                title="🎵 Sekarang Diputar",
-                description=f"[{player.title}]({player.url})",
-                color=0x7289da
-            )
-            view = MusicControlView(interaction.guild.id)
+        # --- Spotify detect: link open.spotify.com / awalan 'spotify:' ---
+        spotify_label = None
+        spotify_queries: list[str] = [query]
+        if _is_spotify_url(query) or re.match(r"(?i)^\s*spotify\s*:", query or ""):
+            if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+                await interaction.followup.send(
+                    "❌ Fitur Spotify belum dikonfigurasi bro! Notzee harus isi "
+                    "`SPOTIFY_CLIENT_ID` & `SPOTIFY_CLIENT_SECRET` di Railway Variables dulu. "
+                    "(Bikin gratis di developer.spotify.com/dashboard)",
+                    ephemeral=True,
+                )
+                return
             try:
-                await interaction.followup.send(embed=embed, view=view)
-            except:
-                await interaction.channel.send(embed=embed, view=view)
-        else:
-            music_queues[interaction.guild.id].append(player)
-            msg = f"✅ Menambahkan ke antrean: **{player.title}** (Urutan ke-{len(music_queues[interaction.guild.id])})"
+                spotify_queries, spotify_label = await client.loop.run_in_executor(
+                    None, resolve_spotify_query, query
+                )
+            except Exception as e:
+                await interaction.followup.send(f"❌ Spotify gagal: {e}", ephemeral=True)
+                return
+
+        first_spotify_note = spotify_label  # ditempel di embed lagu pertama
+
+        for idx, yt_query in enumerate(spotify_queries):
+            player = await YTDLSource.from_url(yt_query, loop=client.loop, stream=True)
+
+            if idx == 0 and not voice_client.is_playing():
+                voice_client._last_source = player
+                voice_client.play(player, after=lambda e: play_next(interaction.guild.id, voice_client, interaction.channel))
+                embed = discord.Embed(
+                    title="🎵 Sekarang Diputar",
+                    description=f"[{player.title}]({player.url})",
+                    color=0x7289da
+                )
+                if first_spotify_note:
+                    embed.set_footer(text=f"🔗 via {first_spotify_note}")
+                    first_spotify_note = None
+                view = MusicControlView(interaction.guild.id)
+                try:
+                    await interaction.followup.send(embed=embed, view=view)
+                except:
+                    await interaction.channel.send(embed=embed, view=view)
+            else:
+                music_queues[interaction.guild.id].append(player)
+                if idx == 0:
+                    msg = f"✅ Menambahkan ke antrean: **{player.title}** (Urutan ke-{len(music_queues[interaction.guild.id])})"
+                    try:
+                        await interaction.followup.send(msg)
+                    except:
+                        await interaction.channel.send(msg)
+        # Kabari kalau playlist/album Spotify masuk antrean banyak
+        if spotify_label and len(spotify_queries) > 1:
             try:
-                await interaction.followup.send(msg)
+                await interaction.channel.send(
+                    f"✅ **{spotify_label}** masuk antrean bro! Lagu pertama langsung diputar, "
+                    f"sisanya ({len(spotify_queries) - 1}) nyusul di queue. Cek `/squeue` 😉"
+                )
             except:
-                await interaction.channel.send(msg)
+                pass
 
     except Exception as e:
         logger.error(f"Music Error: {e}\n{traceback.format_exc()}")
