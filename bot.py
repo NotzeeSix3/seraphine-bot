@@ -20,6 +20,7 @@ import os
 import random
 import re
 import ssl
+import tempfile
 import certifi
 ssl._create_default_https_context = ssl._create_unverified_context
 os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -69,11 +70,21 @@ COOKIES_FILE = _get_cookies_file()
 if COOKIES_FILE:
     ytdl_log.info(f"Menggunakan cookies YouTube dari: {COOKIES_FILE}")
 
+# Folder temp buat hasil download audio (dibersihkan tiap selesai diputar)
+_DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "seraphine_music")
+try:
+    os.makedirs(_DOWNLOAD_DIR, exist_ok=True)
+except Exception as _e:
+    _DOWNLOAD_DIR = tempfile.gettempdir()
+    ytdl_log.warning(f"Gagal bikin folder download, pakai tmp: {_e}")
+
 def _make_ytdl(player_clients=None):
     cookies_file = _get_cookies_file()
     opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+        # Format audio paling kompatibel. Fallback 'best' supaya tidak
+        # menghasilkan file '.NA' di container tanpa postprocessor.
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'outtmpl': os.path.join(_DOWNLOAD_DIR, '%(id)s.%(ext)s'),
         'restrictfilenames': True,
         'noplaylist': True,
         'nocheckcertificate': True,
@@ -83,6 +94,9 @@ def _make_ytdl(player_clients=None):
         'no_warnings': True,
         'default_search': 'auto',
         'source_address': '0.0.0.0',
+        'nopart': False,
+        'retries': 3,
+        'fragment_retries': 3,
     }
     if player_clients:
         opts['extractor_args'] = {'youtube': {'player_client': player_clients}}
@@ -191,11 +205,33 @@ def _extract_info_with_fallback(url, download):
                 continue
     raise last_err
 
-ffmpeg_options = {
-    'options': '-vn',
-    'before_options': ('-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
-                       f'-user_agent "{_FFMPEG_UA}"'),
-}
+def _build_ffmpeg_options(data=None):
+    """Bangun opsi ffmpeg. Kalau data punya http_headers dari yt-dlp,
+    pakai header itu (Cookie/Referer/UA) supaya googlevideo.com tidak 403."""
+    hdrs = (data or {}).get('http_headers') or {}
+    before = ('-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5')
+    # User-Agent
+    ua = hdrs.get('User-Agent') or _FFMPEG_UA
+    before += f' -user_agent "{ua}"'
+    # Header tambahan yang sering wajib buat googlevideo
+    extra = []
+    if hdrs.get('Referer'):
+        extra.append(f'Referer: {hdrs["Referer"]}')
+    else:
+        extra.append('Referer: https://www.youtube.com/')
+    if hdrs.get('Cookie'):
+        extra.append(f'Cookie: {hdrs["Cookie"]}')
+    if hdrs.get('Origin'):
+        extra.append(f'Origin: {hdrs["Origin"]}')
+    extra.append('Accept: */*')
+    extra.append('Accept-Language: en-US,en;q=0.9')
+    if extra:
+        joined = '\r\n'.join(extra) + '\r\n'
+        before += f' -headers "{joined}"'
+    return {'options': '-vn', 'before_options': before}
+
+
+ffmpeg_options = _build_ffmpeg_options()
 
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
@@ -207,41 +243,62 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False):
         loop = loop or asyncio.get_event_loop()
-        
+
         if not url.startswith(('http://', 'https://', 'www.')):
             if not url.startswith('ytsearch'):
                 url = f"ytsearch1:{url}"
 
-        try:
-            data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(url, download=False))
+        def _resolve():
+            """Resolve ke data info. Prioritas: download ke FILE (anti-403).
+            Kalau download gagal, baru coba ambil direct stream URL."""
+            # 1) Coba download ke file lokal (paling andal di IP datacenter)
+            try:
+                data = _extract_info_with_fallback(url, download=True)
+                if data.get('entries'):
+                    data = data['entries'][0]
+                if data:
+                    # yt-dlp set filepath / _filename setelah download
+                    fn = (data.get('filepath')
+                          or data.get('_filename')
+                          or ytdl.prepare_filename(data))
+                    if fn and os.path.exists(fn):
+                        return data, fn
+            except Exception as e:
+                ytdl_log.warning(f"download=True gagal, coba stream URL: {e}")
+
+            # 2) Fallback: direct stream URL
+            data = _extract_info_with_fallback(url, download=False)
             if not data:
                 raise Exception("YouTube extraction kosong (data None)")
             if data.get('entries'):
                 data = data['entries'][0]
                 if not data.get('url'):
                     video_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
-                    data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(video_url, download=False))
+                    data = _extract_info_with_fallback(video_url, download=False)
                     if data and data.get('entries'):
                         data = data['entries'][0]
             elif 'entries' in data:
                 raise Exception("Tidak ada hasil pencarian di YouTube.")
-            filename = data.get('url')
-            if not filename:
+            if not data.get('url'):
                 raise Exception("No stream URL")
-        except Exception as e:
-            logger.error(f"from_url stream-retry menuju download=True: {e}")
-            data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(url, download=True))
-            if not data:
-                raise Exception("YouTube extraction kosong total (semua player_client gagal) — cek YOUTUBE_COOKIES / koneksi")
-            if data.get('entries'):
-                data = data['entries'][0]
-            if not data or not isinstance(data, dict):
-                raise Exception("YouTube extraction kosong / hasil pencarian tidak ditemukan")
-            filename = ytdl.prepare_filename(data)
+            return data, None
 
-        if not filename:
-            raise Exception("Gagal mendapatkan URL stream / file dari YouTube.")
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        data, local_file = await loop.run_in_executor(None, _resolve)
+
+        if not data or not isinstance(data, dict):
+            raise Exception("YouTube extraction kosong / hasil pencarian tidak ditemukan.")
+
+        # Pilih sumber: file lokal (aman) atau stream URL (dengan header lengkap)
+        if local_file and os.path.exists(local_file):
+            source_path = local_file
+            opts = {'options': '-vn'}  # file lokal gak perlu header
+        else:
+            source_path = data.get('url')
+            if not source_path:
+                raise Exception("Gagal mendapatkan URL stream / file dari YouTube.")
+            opts = _build_ffmpeg_options(data)
+
+        return cls(discord.FFmpegPCMAudio(source_path, **opts), data=data)
 
 # Antrean musik per server
 music_queues = defaultdict(list)
@@ -602,7 +659,23 @@ async def _autoplay_next(guild_id, voice_client, channel):
     except Exception as e:
         logger.error(f"Autoplay error: {e}")
 
+def _cleanup_old_downloads(max_age_sec=900):
+    """Hapus file audio lama di _DOWNLOAD_DIR biar disk container gak penuh."""
+    try:
+        now = time.time()
+        for name in os.listdir(_DOWNLOAD_DIR):
+            p = os.path.join(_DOWNLOAD_DIR, name)
+            try:
+                if os.path.isfile(p) and (now - os.path.getmtime(p)) > max_age_sec:
+                    os.remove(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def play_next(guild_id, voice_client, channel):
+    _cleanup_old_downloads()
     # Loop aktif: replay source terakhir (disimpan di atribut voice_client)
     if music_loop.get(guild_id) and voice_client.is_connected():
         src = getattr(voice_client, "_last_source", None)
