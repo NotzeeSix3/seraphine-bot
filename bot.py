@@ -1696,13 +1696,6 @@ async def on_message(pesan):
             await _handle_spam_violation(pesan, violation)
             return
 
-    # ============================================================
-    #  RATE LIMIT CHECK
-    # ============================================================
-    if not check_rate_limit(pesan.author.id):
-        logger.warning(f"Rate limit hit for user {pesan.author.id}")
-        return
-    
     isi = pesan.content.strip()
     pertanyaan = None
     command = None
@@ -1715,7 +1708,15 @@ async def on_message(pesan):
     elif client.user in pesan.mentions:
         pertanyaan = isi.replace(f"<@{client.user.id}>", "").strip()
     
+    # Kalau bukan command / bukan mention bot, abaikan (jangan rate limit chat biasa member!)
     if not pertanyaan:
+        return
+    
+    # ============================================================
+    #  RATE LIMIT CHECK (Hanya untuk pesan yang manggil bot/AI)
+    # ============================================================
+    if not check_rate_limit(pesan.author.id):
+        logger.warning(f"Rate limit hit for user {pesan.author.id} ({pesan.author.name})")
         return
     
     logger.info(f"Message from {pesan.author.name}: {pertanyaan[:50]}")
