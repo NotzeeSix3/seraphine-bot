@@ -762,11 +762,8 @@ KEPRIBADIAN = (
     "Kalau user minta penjelasan lebih detail atau deep-dive, baru berikan jawaban yang lebih panjang dan lengkap. "
     "PENTING: Ketika diminta buatin code/coding, LANGSUNG berikan code lengkap dengan code block (```python atau ```javascript dll) tanpa basa-basi panjang. "
     "Jawab pakai bahasa Indonesia yang gaul tapi sopan. "
-        "Utamakan jawaban singkat, padat, dan jelas. "
-        "PENTING FAKTA: Presiden Indonesia sekarang adalah PRABOWO SUBIANTO (sejak Oktober 2024), "
-        "bukan Jokowi lagi. Kalau ditanya soal presiden/wapres/pejabat Indonesia, sebutkan yang "
-        "sekarang berdasarkan fakta ini, jangan jawab dari ingatan lama."
-    )
+    "Utamakan jawaban singkat, padat, dan jelas. ""PENTING FAKTA: Presiden Indonesia sekarang adalah PRABOWO SUBIANTO (sejak Oktober 2024), ""bukan Jokowi lagi. Kalau ditanya soal presiden/wapres/pejabat Indonesia, sebutkan yang ""sekarang berdasarkan fakta ini, jangan jawab dari ingatan lama."
+)
 
 # ============================================================
 #  LOGGING SETUP
@@ -1741,7 +1738,7 @@ NEWS_CACHE = {"time": 0, "text": ""}
 NEWS_CACHE_TTL = 1800  # 30 menit
 
 def fetch_trending_news() -> str:
-    """Ambil berita terkini dari RSS feed Indonesia (gratis, tanpa API key, aman dari cloud).
+    """Ambil berita terkini dari RSS feed Indonesia (gratis, tanpa API key, cloud-safe).
     SELALU mengembalikan string (gak pernah throw), cache 30 menit."""
     import time as _time
     now = _time.time()
@@ -1776,9 +1773,9 @@ def fetch_trending_news() -> str:
                 continue
         if not judul_list:
             return ""
-        teks = "🔥 **Berita Terbaru:**\n"
+        teks = "Berita Terbaru:\n"
         for i, j in enumerate(judul_list[:6], 1):
-            teks += f"**{i}. {j}**\n"
+            teks += f"{i}. {j}\n"
         logger.info(f"News RSS fetched: {len(judul_list)} judul")
         NEWS_CACHE["text"] = teks
         NEWS_CACHE["time"] = _time.time()
@@ -1786,6 +1783,7 @@ def fetch_trending_news() -> str:
     except Exception as e:
         logger.error(f"Error fetch RSS: {e}")
         return ""
+
 
 # ============================================================
 #  AI FUNCTIONS (MERGED & OPTIMIZED)
@@ -1799,6 +1797,10 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
     try:
         # Build context
         context_parts = [KEPRIBADIAN]
+        
+        # SELALU inject tanggal real-time biar model tau tahun berapa.
+        now_str = datetime.now().strftime("%d %B %Y, %H:%M")
+        context_parts.append("Tanggal & waktu sekarang: " + now_str + ". Gunakan ini sebagai acuan 'hari ini' buat semua jawaban yang tergantung waktu.")
         
         if include_trending:
             # Jalankan di thread terpisah supaya event loop tetap responsif
@@ -2283,7 +2285,7 @@ async def on_message(pesan):
         return
 
     async with pesan.channel.typing():
-        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=False, channel_id=pesan.channel.id)
+        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=True, channel_id=pesan.channel.id)
     
     jawaban = truncate_response(jawaban)
     
@@ -2301,7 +2303,7 @@ async def on_message(pesan):
 
 if __name__ == "__main__":
     # Validate environment variables
-    if not DISCORD_TOKEN or not OPENROUTER_API_KEY or not NEWSAPI_KEY:
+    if not DISCORD_TOKEN or not OPENROUTER_API_KEY:
         logger.error("❌ Missing environment variables! Check .env file")
         exit(1)
     
