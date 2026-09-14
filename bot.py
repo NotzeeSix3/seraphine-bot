@@ -1734,8 +1734,17 @@ def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES, channel_id
 #  NEWS FUNCTIONS
 # ============================================================
 
+NEWS_CACHE = {"time": 0, "text": ""}
+NEWS_CACHE_TTL = 1800  # 30 menit
+
 def fetch_trending_news() -> str:
-    """Fetch trending news from NewsAPI with fallback."""
+    """Fetch trending news from NewsAPI with fallback. Cached 30 menit agar tiap chat
+    tidak memanggil NewsAPI (rate-limit 100 req/hari di free tier)."""
+    import time as _time
+    now = _time.time()
+    # Cache hit dalam 30 menit -> reuse, hemat rate limit
+    if NEWS_CACHE["text"] and (now - NEWS_CACHE["time"]) < NEWS_CACHE_TTL:
+        return NEWS_CACHE["text"]
     try:
         url = f"{NEWSAPI_BASE_URL}/everything"
         params = {
@@ -1773,6 +1782,8 @@ def fetch_trending_news() -> str:
             berita_text += f"   *Sumber: {source}*\n\n"
         
         logger.info("News fetched successfully")
+        NEWS_CACHE["text"] = berita_text
+        NEWS_CACHE["time"] = _time.time()
         return berita_text
         
     except requests.exceptions.Timeout:
@@ -1794,6 +1805,11 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
     try:
         # Build context
         context_parts = [KEPRIBADIAN]
+        
+        # PENTING REAL-TIME: beri tahu AI tanggal & waktu SEKARANG setiap chat,
+        # biar model gak jawab pakai training-data lama (mis. presiden masih Jokowi).
+        now_str = datetime.now().strftime("%d %B %Y, %H:%M  (hari ini)")
+        context_parts.append(f"TANGGAL/WAKTU SEKARANG: {now_str}. Gunakan info ini sebagai 'hari ini' ketika ditanya hal-hal yang bergantung waktu (presiden, tanggal, usia, umur kejadian, dll). Jangan gunakan pengetahuanmu yang lebih lama dari tanggal ini untuk fakta yang bisa berubah (seperti jabatan presiden/pejabat), kecuali yakin belum ada perubahan.")
         
         if include_trending:
             # Jalankan di thread terpisah supaya event loop tetap responsif
@@ -2278,7 +2294,7 @@ async def on_message(pesan):
         return
 
     async with pesan.channel.typing():
-        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=False, channel_id=pesan.channel.id)
+        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=True, channel_id=pesan.channel.id)
     
     jawaban = truncate_response(jawaban)
     
