@@ -762,8 +762,11 @@ KEPRIBADIAN = (
     "Kalau user minta penjelasan lebih detail atau deep-dive, baru berikan jawaban yang lebih panjang dan lengkap. "
     "PENTING: Ketika diminta buatin code/coding, LANGSUNG berikan code lengkap dengan code block (```python atau ```javascript dll) tanpa basa-basi panjang. "
     "Jawab pakai bahasa Indonesia yang gaul tapi sopan. "
-    "Utamakan jawaban singkat, padat, dan jelas."
-)
+        "Utamakan jawaban singkat, padat, dan jelas. "
+        "PENTING FAKTA: Presiden Indonesia sekarang adalah PRABOWO SUBIANTO (sejak Oktober 2024), "
+        "bukan Jokowi lagi. Kalau ditanya soal presiden/wapres/pejabat Indonesia, sebutkan yang "
+        "sekarang berdasarkan fakta ini, jangan jawab dari ingatan lama."
+    )
 
 # ============================================================
 #  LOGGING SETUP
@@ -1734,53 +1737,55 @@ def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES, channel_id
 #  NEWS FUNCTIONS
 # ============================================================
 
+NEWS_CACHE = {"time": 0, "text": ""}
+NEWS_CACHE_TTL = 1800  # 30 menit
+
 def fetch_trending_news() -> str:
-    """Fetch trending news from NewsAPI with fallback."""
+    """Ambil berita terkini dari RSS feed Indonesia (gratis, tanpa API key, aman dari cloud).
+    SELALU mengembalikan string (gak pernah throw), cache 30 menit."""
+    import time as _time
+    now = _time.time()
+    if NEWS_CACHE["text"] and (now - NEWS_CACHE["time"]) < NEWS_CACHE_TTL:
+        return NEWS_CACHE["text"]
     try:
-        url = f"{NEWSAPI_BASE_URL}/everything"
-        params = {
-            "q": "Indonesia OR viral OR trending",
-            "sortBy": "publishedAt",
-            "language": "id",
-            "pageSize": 5,
-            "apiKey": NEWSAPI_KEY
-        }
-        
-        logger.info("Fetching trending news...")
-        res = requests.get(url, params=params, timeout=10)
-        hasil = res.json()
-        
-        if hasil.get("status") != "ok":
-            error_msg = hasil.get("message", "Unknown error")
-            logger.warning(f"NewsAPI error: {error_msg}")
-            return f"⚠️ Gak bisa fetch berita: {error_msg}"
-        
-        articles = hasil.get("articles", [])
-        if not articles:
-            return "⚠️ Gak ada berita trending saat ini 😅"
-        
-        berita_text = "🔥 **Berita Trending Hari Ini:**\n\n"
-        for i, article in enumerate(articles, 1):
-            title = article.get("title", "No title")
-            desc = article.get("description", "No description")
-            source = article.get("source", {}).get("name", "Unknown")
-            
-            if desc and len(desc) > 120:
-                desc = desc[:120] + "..."
-            
-            berita_text += f"**{i}. {title}**\n"
-            berita_text += f"   {desc}\n"
-            berita_text += f"   *Sumber: {source}*\n\n"
-        
-        logger.info("News fetched successfully")
-        return berita_text
-        
-    except requests.exceptions.Timeout:
-        logger.warning("News API timeout")
-        return "⚠️ Timeout fetch berita, coba lagi nanti"
+        feeds = [
+            "https://www.cnnindonesia.com/nasional/rss",
+            "https://rss.tempo.co/nasional",
+        ]
+        import re as _re
+        import xml.etree.ElementTree as _ET
+        judul_list = []
+        for url in feeds:
+            if len(judul_list) >= 6:
+                break
+            try:
+                r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code != 200:
+                    continue
+                root = _ET.fromstring(r.content)
+                for item in root.iter("item"):
+                    t = item.find("title")
+                    if t is not None and t.text:
+                        judul = _re.sub(r"\s+", " ", t.text).strip()
+                        if judul and judul not in judul_list:
+                            judul_list.append(judul)
+                    if len(judul_list) >= 6:
+                        break
+            except Exception as e:
+                logger.warning(f"RSS gagal {url}: {str(e)[:50]}")
+                continue
+        if not judul_list:
+            return ""
+        teks = "🔥 **Berita Terbaru:**\n"
+        for i, j in enumerate(judul_list[:6], 1):
+            teks += f"**{i}. {j}**\n"
+        logger.info(f"News RSS fetched: {len(judul_list)} judul")
+        NEWS_CACHE["text"] = teks
+        NEWS_CACHE["time"] = _time.time()
+        return teks
     except Exception as e:
-        logger.error(f"Error fetching news: {e}")
-        return f"⚠️ Error fetch berita: {str(e)[:50]}"
+        logger.error(f"Error fetch RSS: {e}")
+        return ""
 
 # ============================================================
 #  AI FUNCTIONS (MERGED & OPTIMIZED)
