@@ -1734,60 +1734,53 @@ def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES, channel_id
 #  NEWS FUNCTIONS
 # ============================================================
 
-NEWS_CACHE = {"time": 0, "text": ""}
-NEWS_CACHE_TTL = 1800  # 30 menit
-
 def fetch_trending_news() -> str:
-    """Ambil berita terkini dari RSS feed media Indonesia (GRATIS, tanpa API key,
-    bisa diakses dari server/cloud — beda dengan NewsAPI free tier yang blokir cloud).
-    Cached 30 menit biar hemat & cepat."""
-    import time as _time
-    now = _time.time()
-    if NEWS_CACHE["text"] and (now - NEWS_CACHE["time"]) < NEWS_CACHE_TTL:
-        return NEWS_CACHE["text"]
-
-    # Sumber RSS berita Indonesia (urut prioritas)
-    RSS_FEEDS = [
-        ("Detik", "https://rss.detik.com/index.php/detikcom"),
-        ("CNN Indonesia", "https://www.cnnindonesia.com/nasional/rss"),
-        ("Tempo", "https://rss.tempo.co/nasional"),
-        ("Kompas", "https://rss.kompas.com/api/feed/indonesia"),
-    ]
-    import re as _re
-    import xml.etree.ElementTree as _ET
-
-    judul_list = []
-    for sumber, url in RSS_FEEDS:
-        if len(judul_list) >= 6:
-            break
-        try:
-            r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200:
-                continue
-            root = _ET.fromstring(r.content)
-            for item in root.iter("item"):
-                title_el = item.find("title")
-                if title_el is not None and title_el.text:
-                    t = _re.sub(r"\s+", " ", title_el.text).strip()
-                    if t and t not in judul_list:
-                        judul_list.append(t)
-                    if len(judul_list) >= 6:
-                        break
-        except Exception as e:
-            logger.warning(f"RSS {sumber} gagal: {str(e)[:60]}")
-            continue
-
-    if not judul_list:
-        return "⚠️ Gak bisa ambil berita terbaru saat ini 😅"
-
-    berita_text = "🔥 Berita Terbaru (sumber RSS media Indonesia):\n\n"
-    for i, judul in enumerate(judul_list[:6], 1):
-        berita_text += f"{i}. {judul}\n"
-
-    logger.info(f"News RSS fetched: {len(judul_list)} judul")
-    NEWS_CACHE["text"] = berita_text
-    NEWS_CACHE["time"] = _time.time()
-    return berita_text
+    """Fetch trending news from NewsAPI with fallback."""
+    try:
+        url = f"{NEWSAPI_BASE_URL}/everything"
+        params = {
+            "q": "Indonesia OR viral OR trending",
+            "sortBy": "publishedAt",
+            "language": "id",
+            "pageSize": 5,
+            "apiKey": NEWSAPI_KEY
+        }
+        
+        logger.info("Fetching trending news...")
+        res = requests.get(url, params=params, timeout=10)
+        hasil = res.json()
+        
+        if hasil.get("status") != "ok":
+            error_msg = hasil.get("message", "Unknown error")
+            logger.warning(f"NewsAPI error: {error_msg}")
+            return f"⚠️ Gak bisa fetch berita: {error_msg}"
+        
+        articles = hasil.get("articles", [])
+        if not articles:
+            return "⚠️ Gak ada berita trending saat ini 😅"
+        
+        berita_text = "🔥 **Berita Trending Hari Ini:**\n\n"
+        for i, article in enumerate(articles, 1):
+            title = article.get("title", "No title")
+            desc = article.get("description", "No description")
+            source = article.get("source", {}).get("name", "Unknown")
+            
+            if desc and len(desc) > 120:
+                desc = desc[:120] + "..."
+            
+            berita_text += f"**{i}. {title}**\n"
+            berita_text += f"   {desc}\n"
+            berita_text += f"   *Sumber: {source}*\n\n"
+        
+        logger.info("News fetched successfully")
+        return berita_text
+        
+    except requests.exceptions.Timeout:
+        logger.warning("News API timeout")
+        return "⚠️ Timeout fetch berita, coba lagi nanti"
+    except Exception as e:
+        logger.error(f"Error fetching news: {e}")
+        return f"⚠️ Error fetch berita: {str(e)[:50]}"
 
 # ============================================================
 #  AI FUNCTIONS (MERGED & OPTIMIZED)
@@ -1801,32 +1794,6 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
     try:
         # Build context
         context_parts = [KEPRIBADIAN]
-        
-        # PENTING REAL-TIME: beri tahu AI tanggal & waktu SEKARANG setiap chat,
-        # biar model gak jawab pakai training-data lama (mis. presiden masih Jokowi).
-        now_str = datetime.now().strftime("%d %B %Y, %H:%M  (hari ini)")
-        context_parts.append(
-            f"TANGGAL/WAKTU SEKARANG: {now_str}. Ini adalah tanggal asli saat pesan ini dibuat. "
-            "ATURAN KERAS: Untuk SEMUA fakta yang bisa berubah seiring waktu — terutama JABATAN "
-            "pejabat (presiden, wakil presiden, menteri, gubernur), pemilik klub, bagian dari "
-            "event, rekor, harga, versi terbaru — kamu WAJIB menggunakan data dari 'Berita Trending "
-            "Saat Ini' di bawah (jika ada) atau mengaku tidak yakin. DILARANG KERAS menjawab "
-            "berdasarkan pengetahuan lamamu sendiri untuk hal-hal ini. Contoh: jangan pernah bilang "
-            "presiden Indonesia sekarang Jokowi hanya karena itu yang kamu hafal dari data lama. "
-            "Jika berita terkini tidak memuat jawabannya, katakan dengan jujur: 'Aku belum dapat "
-            "info terbaru soal itu, coba cek berita terbaru ya' — JANGAN mengarang atau menebak "
-            "dari ingatan lama."
-        )
-
-        # FAKTA JABATAN TERKINI — supaya model tidak menebak dari data training lama.
-        # Update blok ini kalau ada pergantian pejabat (bagian paling andal).
-        context_parts.append(
-            "FAKTA TERKINI (WAJIB DIPAKAI, jangan bantah):\n"
-            "- Presiden Indonesia saat ini: PRABOWO SUBIANTO (menjabat sejak 20 Oktober 2024). "
-            "Joko Widodo (Jokowi) sudah BUKAN presiden lagi.\n"
-            "- Wakil Presiden Indonesia saat ini: GIBRAN RAKABUMING RAKA (sejak 20 Oktober 2024).\n"
-            "Kalau ditanya soal presiden/wapres Indonesia, jawab dengan fakta di atas, BUKAN Jokowi."
-        )
         
         if include_trending:
             # Jalankan di thread terpisah supaya event loop tetap responsif
@@ -2311,7 +2278,7 @@ async def on_message(pesan):
         return
 
     async with pesan.channel.typing():
-        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=True, channel_id=pesan.channel.id)
+        jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=False, channel_id=pesan.channel.id)
     
     jawaban = truncate_response(jawaban)
     
