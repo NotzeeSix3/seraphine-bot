@@ -750,7 +750,7 @@ AI_MODEL = os.getenv("AI_MODEL", "google/gemma-4-31b-it:free").strip()
 AI_FALLBACK_MODELS = [
     m.strip() for m in os.getenv(
         "AI_FALLBACK_MODELS",
-        "google/gemma-4-31b-it:free,nvidia/nemotron-3-super-120b-a12b:free,z-ai/glm-5.2:free,thinkingmachines/inkling:free"
+        "google/gemma-4-31b-it:free,nvidia/nemotron-3-super-120b-a12b:free,z-ai/glm-5.2:free,inclusionai/ling-3.0-flash-vl:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free"
     ).split(",") if m.strip()
 ]
 
