@@ -1954,7 +1954,7 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             "model": AI_MODEL,
             "messages": [{"role": "user", "content": full_prompt}],
             "temperature": 0.7,
-            "max_tokens": 1500
+            "max_tokens": 4000,  # cukup buat reasoning models (nemotron habiskan token buat mikir dulu)
         }
         
         logger.info(f"Requesting AI response for user {user_id}")
