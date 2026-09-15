@@ -659,8 +659,10 @@ async def _autoplay_next(guild_id, voice_client, channel):
     except Exception as e:
         logger.error(f"Autoplay error: {e}")
 
-def _cleanup_old_downloads(max_age_sec=900):
-    """Hapus file audio lama di _DOWNLOAD_DIR biar disk container gak penuh."""
+def _cleanup_old_downloads(max_age_sec=7200):
+    """Hapus file audio lama di _DOWNLOAD_DIR biar disk container gak penuh.
+    TTL 2 jam: lagu loop / queue panjang bisa reference file yang sama —
+    TTL 15 menit dulu bikin loop replay main file yang udah dihapus."""
     try:
         now = time.time()
         for name in os.listdir(_DOWNLOAD_DIR):
@@ -1425,6 +1427,7 @@ async def slash_play(interaction: discord.Interaction, query: str):
 
         first_spotify_note = spotify_label  # ditempel di embed lagu pertama
         successful_tracks = 0
+        queued_titles: list[str] = []  # buat ringkasan lagu yang masuk antrean
 
         for idx, yt_query in enumerate(spotify_queries):
             try:
@@ -1453,12 +1456,26 @@ async def slash_play(interaction: discord.Interaction, query: str):
                     await interaction.channel.send(embed=embed, view=view)
             else:
                 music_queues[interaction.guild.id].append(player)
-                if successful_tracks == 1:
+                queued_titles.append(player.title or yt_query)
+                # Notif per-lagu HANYA untuk single song (bukan playlist),
+                # playlist dirangkum sekali di akhir biar gak spam.
+                if len(spotify_queries) == 1 and successful_tracks == 1:
                     msg = f"✅ Menambahkan ke antrean: **{player.title}** (Urutan ke-{len(music_queues[interaction.guild.id])})"
                     try:
                         await interaction.followup.send(msg)
                     except:
                         await interaction.channel.send(msg)
+
+        # Ringkasan sekali untuk playlist/album yang masuk antrean
+        if queued_titles and len(spotify_queries) > 1:
+            preview = "\n".join(f"`{i+1}.` {t}" for i, t in enumerate(queued_titles[:10]))
+            extra = f"\n…dan {len(queued_titles) - 10} lagu lagi" if len(queued_titles) > 10 else ""
+            try:
+                await interaction.channel.send(
+                    f"📥 **{len(queued_titles)} lagu masuk antrean:**\n{preview}{extra}"
+                )
+            except:
+                pass
 
         if successful_tracks == 0:
             await interaction.followup.send("❌ Gagal memutar lagu dari Spotify/YouTube (semua lagu tidak ditemukan).", ephemeral=True)
@@ -1715,7 +1732,7 @@ def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES, channel_id
         else:
             same_channel = []
         picked = same_channel if len(same_channel) >= 1 else [(m, r) for (m, r, ch) in rows[:limit]]
-        picked = picked[-limit:]  # urut kronologis
+        picked = picked[::-1]  # rows DESC -> balik ke urutan kronologis (lama -> baru)
         
         history = []
         for user_msg, bot_resp in picked:
@@ -2182,6 +2199,9 @@ async def on_message(pesan):
     #  SERVER INFO COMMAND
     # ============================================================
     if command == "server-info":
+        if not pesan.guild:
+            await pesan.reply("❌ Command ini cuma bisa dipakai di server bro!")
+            return
         if not has_server_permission(pesan.author, pesan.guild):
             await pesan.reply("❌ Hanya admin yang bisa pakai command ini")
             return
@@ -2211,6 +2231,9 @@ async def on_message(pesan):
     #  MEMBER LIST COMMAND
     # ============================================================
     if command == "member-list":
+        if not pesan.guild:
+            await pesan.reply("❌ Command ini cuma bisa dipakai di server bro!")
+            return
         if not has_server_permission(pesan.author, pesan.guild):
             await pesan.reply("❌ Hanya admin yang bisa pakai command ini")
             return
@@ -2231,6 +2254,9 @@ async def on_message(pesan):
     #  CHANNEL LIST COMMAND
     # ============================================================
     if command == "channel-list":
+        if not pesan.guild:
+            await pesan.reply("❌ Command ini cuma bisa dipakai di server bro!")
+            return
         if not has_server_permission(pesan.author, pesan.guild):
             await pesan.reply("❌ Hanya admin yang bisa pakai command ini")
             return
@@ -2251,6 +2277,9 @@ async def on_message(pesan):
     #  ROLE LIST COMMAND
     # ============================================================
     if command == "role-list":
+        if not pesan.guild:
+            await pesan.reply("❌ Command ini cuma bisa dipakai di server bro!")
+            return
         if not has_server_permission(pesan.author, pesan.guild):
             await pesan.reply("❌ Hanya admin yang bisa pakai command ini")
             return

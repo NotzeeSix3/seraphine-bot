@@ -1,11 +1,40 @@
 import os
 import sqlite3
 import json
+import hmac
 import threading
 from datetime import datetime
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 import uvicorn
+
+# ---- Dashboard auth (HTTP Basic) ---------------------------------------
+# Set DASHBOARD_PASSWORD di Railway Variables. Default "seraphine" HANYA
+# buat dev lokal — jangan dipakai di production.
+DASH_USER = os.environ.get("DASHBOARD_USER", "admin")
+DASH_PASS = os.environ.get("DASHBOARD_PASSWORD", "seraphine")
+_AUTH_OK = {"Authorization": "Basic"}
+
+
+def _authorized(request: Request) -> bool:
+    import base64
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        user, _, pwd = decoded.partition(":")
+        return hmac.compare_digest(user, DASH_USER) and hmac.compare_digest(pwd, DASH_PASS)
+    except Exception:
+        return False
+
+
+def _deny() -> Response:
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="Seraphine Dashboard"'},
+        content="Unauthorized",
+    )
 
 # Import bot components so dashboard can host both bot & web UI together!
 try:
@@ -96,6 +125,20 @@ def get_recent_logs(limit=50):
         return [line.strip() for line in lines[-limit:][::-1]]
     except Exception as e:
         return [f"Error reading logs: {e}"]
+
+
+_SANITIZE_KEYS = ("TOKEN", "COOKIE", "SECRET", "PASSWORD", "Authorization", "Bearer ")
+
+
+def _sanitize_logs(lines):
+    """Redact lines that might contain secrets before showing on the dashboard."""
+    out = []
+    for line in lines:
+        if any(k.lower() in line.lower() for k in _SANITIZE_KEYS):
+            out.append("[REDACTED — kemungkinan mengandung credential]")
+        else:
+            out.append(line)
+    return out
 
 def get_music_queues():
     """Live music queue snapshot from the shared bot module (same process)."""
@@ -329,13 +372,15 @@ HTML_TEMPLATE = """
 """
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(request: Request):
+    if not _authorized(request):
+        return _deny()
     config = load_config()
     stats = get_db_stats()
     infractions = get_recent_infractions()
-    logs = get_recent_logs()
+    logs = _sanitize_logs(get_recent_logs())
     music_queues = get_music_queues()
-    
+
     return HTMLResponse(content=render_html(config, stats, infractions, logs, music_queues))
 
 def render_html(config, stats, infractions, logs, music_queues=None):
@@ -348,11 +393,14 @@ def render_html(config, stats, infractions, logs, music_queues=None):
 
 @app.post("/update-config")
 async def update_config(
+    request: Request,
     ai_chat_enabled: bool = Form(False),
     music_enabled: bool = Form(False),
     automod_enabled: bool = Form(False),
     voice_log_enabled: bool = Form(False)
 ):
+    if not _authorized(request):
+        return _deny()
     cfg = {
         "ai_chat_enabled": ai_chat_enabled,
         "music_enabled": music_enabled,
