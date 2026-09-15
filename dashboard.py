@@ -70,11 +70,13 @@ async def startup_event():
                 except Exception as e:
                     fails += 1
                     print(f"Bot error ({fails}/{MAX_FAIL}): {e}")
+                    # backoff sopan: Discord block IP berbasis waktu; nyoba
+                    # terlalu sering malah perpanjang block-nya.
                     if fails < MAX_FAIL:
-                        _time.sleep(min(30 * fails, 120))  # backoff 30s,60s,90s,120s
-            print("Bot failed 5x — killing service so Railway restarts container.")
-            import os as _os
-            _os._exit(1)
+                        wait = min(300 * fails, 900)  # 5m, 10m, 15m, 15m
+                        print(f"Waiting {wait}s before retry (block cooldown)...")
+                        _time.sleep(wait)
+            print("Bot failed 5x — giving up retry; service stays up (dashboard only). Restart manual diperlukan.")
 
         bot_thread = threading.Thread(target=run_bot, daemon=True)
         bot_thread.start()
