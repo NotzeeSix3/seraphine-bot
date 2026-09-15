@@ -1765,6 +1765,46 @@ def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES, channel_id
 NEWS_CACHE = {"time": 0, "text": ""}
 NEWS_CACHE_TTL = 1800  # 30 menit
 
+_WEB_SEARCH_CACHE = {}  # query -> (timestamp, text)
+
+def fetch_web_context(query: str, max_items: int = 5) -> str:
+    """Cari info TERKINI via Google News RSS (gratis, tanpa API key, cloud-safe).
+    Cache 15 menit per query. Selalu return string (gak pernah throw).
+    Dipakai buat inject fakta realtime ke prompt AI — model apapun punya
+    knowledge cutoff, ini yang bikin jawaban gak basi."""
+    import urllib.parse
+    import time as _time
+    q = (query or "").strip()[:120]
+    if not q:
+        return ""
+    now = _time.time()
+    hit = _WEB_SEARCH_CACHE.get(q)
+    if hit and (now - hit[0]) < 900:
+        return hit[1]
+    try:
+        import xml.etree.ElementTree as _ET
+        url = ("https://news.google.com/rss/search?q="
+               + urllib.parse.quote(q) + "&hl=id&gl=ID&ceid=ID:id")
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if r.status_code != 200:
+            return ""
+        root = _ET.fromstring(r.content)
+        items = list(root.iter("item"))[:max_items]
+        out = []
+        for it in items:
+            judul = (it.findtext("title") or "").strip()
+            tgl = (it.findtext("pubDate") or "").strip()
+            sumber = (it.findtext("source") or "").strip()
+            if judul:
+                out.append(f"- {judul} ({sumber}, {tgl})")
+        teks = "\n".join(out)
+        if teks:
+            _WEB_SEARCH_CACHE[q] = (now, teks)
+        return teks
+    except Exception as e:
+        logger.warning(f"Web search RSS gagal: {str(e)[:60]}")
+        return ""
+
 def fetch_trending_news() -> str:
     """Ambil berita terkini dari RSS feed Indonesia (gratis, tanpa API key, cloud-safe).
     SELALU mengembalikan string (gak pernah throw), cache 30 menit."""
@@ -1834,6 +1874,17 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             # Jalankan di thread terpisah supaya event loop tetap responsif
             berita = await asyncio.to_thread(fetch_trending_news)
             context_parts.append(f"Berita Trending Saat Ini:\n{berita}")
+
+        # Web search realtime: cari info terkini soal PERTANYAAN user di
+        # Google News, inject hasilnya ke prompt. Ini bikin jawaban gak
+        # basi walau modelnya punya knowledge cutoff lama (Sri Mulyani dsb).
+        web_ctx = await asyncio.to_thread(fetch_web_context, pertanyaan)
+        if web_ctx:
+            context_parts.append(
+                "Hasil pencarian BERITA TERKINI (Google News, pakai ini sebagai "
+                "fakta terbaru; kalau bentrok dengan ingatanmu, PRIORITASKAN "
+                "hasil pencarian ini dan sebut itu info terbaru):\n" + web_ctx
+            )
         
         history = get_user_history(user_id, channel_id=channel_id)
         if history:
