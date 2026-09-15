@@ -750,6 +750,9 @@ AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.5-flash:free").strip()
 # & stabil). Kalau tidak ada, fallback ke OpenRouter (AI_MODEL).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+# Grounding = Gemini nge-Google jawabannya dulu sebelum jawab (data realtime).
+# Makan quota lebih besar; matikan dengan GEMINI_GROUNDING=0 kalau quota boros.
+GEMINI_GROUNDING = os.getenv("GEMINI_GROUNDING", "1").strip() == "1"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 DB_NAME = "bot_memory.db"
@@ -1846,6 +1849,10 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
                     "contents": [{"parts": [{"text": full_prompt}]}],
                     "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
                 }
+                # Google Search Grounding: jawaban berbasis hasil pencarian
+                # realtime, bukan cuma ingatan training model.
+                if GEMINI_GROUNDING:
+                    gdata["tools"] = [{"google_search": {}}]
                 logger.info(f"Requesting Gemini response for user {user_id}")
                 try:
                     res = await asyncio.wait_for(
