@@ -743,7 +743,10 @@ MOD_LOG_CHANNEL_NAME = os.getenv("MOD_LOG_CHANNEL", "moderator-only").strip()
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 NEWSAPI_BASE_URL = "https://newsapi.org/v2"
 # Model AI — bisa dioverride via env AI_MODEL di Railway tanpa push ulang.
-AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.5-flash:free").strip()
+# Fallback OpenRouter. Slug free lama (gemini-2.5-flash:free) sudah dimatikan
+# OpenRouter (verified 2026-09-15: "unavailable for free"). Nemotron 3 Ultra
+# 550B = model free terbesar yang masih hidup (tested 200 OK).
+AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free").strip()
 
 # ---- Gemini API native (Google AI Studio, free tier harian) -------------
 # Kalau GEMINI_API_KEY ada di env, bot pakai Gemini langsung (lebih pinter
