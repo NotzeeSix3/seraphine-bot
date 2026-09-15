@@ -53,12 +53,29 @@ CONFIG_FILE = "config.json"
 async def startup_event():
     if BOT_IMPORT_SUCCESS and DISCORD_TOKEN:
         def run_bot():
-            try:
-                print("Starting Discord Bot in background thread...")
-                client.run(DISCORD_TOKEN)
-            except Exception as e:
-                print(f"Bot error: {e}")
-        
+            # Retry loop: kalau bot crash (gateway block, network, dll),
+            # coba lagi. Kalau tetap mati 5x berturut-turut, matikan
+            # SELURUH service (uvicorn ikut) supaya Railway restart
+            # container — dashboard zombie tanpa bot gak ada gunanya.
+            import time as _time
+            MAX_FAIL = 5
+            fails = 0
+            while fails < MAX_FAIL:
+                try:
+                    print("Starting Discord Bot in background thread...")
+                    client.run(DISCORD_TOKEN)
+                    # client.run return normal = shutdown disengaja
+                    print("Bot shut down normally.")
+                    return
+                except Exception as e:
+                    fails += 1
+                    print(f"Bot error ({fails}/{MAX_FAIL}): {e}")
+                    if fails < MAX_FAIL:
+                        _time.sleep(min(30 * fails, 120))  # backoff 30s,60s,90s,120s
+            print("Bot failed 5x — killing service so Railway restarts container.")
+            import os as _os
+            _os._exit(1)
+
         bot_thread = threading.Thread(target=run_bot, daemon=True)
         bot_thread.start()
 
