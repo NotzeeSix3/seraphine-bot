@@ -743,9 +743,16 @@ MOD_LOG_CHANNEL_NAME = os.getenv("MOD_LOG_CHANNEL", "moderator-only").strip()
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 NEWSAPI_BASE_URL = "https://newsapi.org/v2"
 # Model AI — bisa dioverride via env AI_MODEL di Railway tanpa push ulang.
-# Fallback OpenRouter. Nemotron-3-ultra-550b terbukti TIMEOUT >60s di queue
-# free (2026-09-15, tested). Gemma-4-31b: 1.7s, 31B param, Google-made.
+# Fallback OpenRouter. Free pool OpenRouter itu FLAPPY: model hidup, timeout,
+# 429, gantian tiap jam (tested 2026-09-15: nemotron-ultra timeout, gemma 429
+# menit kemudian). Maka pakai CHAIN: coba model berurutan sampai ada yang jawab.
 AI_MODEL = os.getenv("AI_MODEL", "google/gemma-4-31b-it:free").strip()
+AI_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv(
+        "AI_FALLBACK_MODELS",
+        "google/gemma-4-31b-it:free,nvidia/nemotron-3-super-120b-a12b:free,z-ai/glm-5.2:free,thinkingmachines/inkling:free"
+    ).split(",") if m.strip()
+]
 
 # ---- Gemini API native (Google AI Studio, free tier harian) -------------
 # Kalau GEMINI_API_KEY ada di env, bot pakai Gemini langsung (lebih pinter
@@ -1948,47 +1955,58 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             "HTTP-Referer": "https://discord.com",
             "X-Title": "Seraphine AI Bot"
         }
-        
-        data = {
-            "model": AI_MODEL,
-            "messages": [{"role": "user", "content": full_prompt}],
-            "temperature": 0.7,
-            "max_tokens": 4000,  # cukup buat reasoning models (nemotron habiskan token buat mikir dulu)
-        }
-        
-        logger.info(f"Requesting AI response for user {user_id}")
-        # requests.post sinkron nge-block event loop Discord -> bot freeze.
-        # Jalankan di thread terpisah biar bot tetap responsif.
-        try:
-            res = await asyncio.wait_for(
-                asyncio.to_thread(
-                    requests.post,
-                    f"{OPENROUTER_BASE_URL}/chat/completions",
-                    json=data,
-                    headers=headers,
-                    timeout=45
-                ),
-                timeout=50
-            )
-        except asyncio.TimeoutError:
-            logger.warning("OpenRouter timeout (async guard)")
-            return "⏱️ AI sedang load, coba lagi dalam beberapa detik"
-        hasil = res.json()
-        
-        if "error" in hasil:
-            error_msg = hasil["error"].get("message", "Unknown error")
-            logger.error(f"OpenRouter error: {error_msg}")
-            return f"❌ Duh, AI error: {error_msg[:100]}"
-        
-        balasan = hasil.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        
-        if balasan:
-            save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
-            logger.info(f"Response saved for user {user_id}")
-            return balasan
-        else:
-            return "❌ Hmm, gua gabisa jawab pertanyaan itu 😅"
-        
+
+        # Chain: free pool OpenRouter flappy (429/timeout gantian), jadi coba
+        # beberapa model berurutan sampai ada yang jawab.
+        models_to_try = [AI_MODEL] + [m for m in AI_FALLBACK_MODELS if m != AI_MODEL]
+        last_error = "no model tried"
+
+        for model in models_to_try:
+            data = {
+                "model": model,
+                "messages": [{"role": "user", "content": full_prompt}],
+                "temperature": 0.7,
+                "max_tokens": 4000,  # cukup buat reasoning models
+            }
+            logger.info(f"Requesting AI response for user {user_id} (model: {model})")
+            try:
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        requests.post,
+                        f"{OPENROUTER_BASE_URL}/chat/completions",
+                        json=data,
+                        headers=headers,
+                        timeout=30
+                    ),
+                    timeout=35
+                )
+            except (asyncio.TimeoutError, requests.exceptions.Timeout):
+                logger.warning(f"OpenRouter timeout: {model}")
+                last_error = f"{model}: timeout"
+                continue
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"Connection error: {model}")
+                last_error = f"{model}: connection"
+                continue
+
+            hasil = res.json()
+            if "error" in hasil:
+                error_msg = hasil["error"].get("message", "Unknown error")
+                logger.warning(f"OpenRouter error ({model}): {error_msg[:80]}")
+                last_error = f"{model}: {error_msg[:60]}"
+                continue  # model mati/limit — coba model berikutnya
+
+            balasan = hasil.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if balasan:
+                save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
+                logger.info(f"Response saved for user {user_id} (via {model})")
+                return balasan
+            # jawaban kosong = model aneh, lanjut model berikutnya
+            last_error = f"{model}: empty response"
+
+        logger.error(f"Semua model gagal: {last_error}")
+        return "⏱️ AI sedang load, coba lagi dalam beberapa detik"
+
     except requests.exceptions.Timeout:
         logger.warning("OpenRouter timeout")
         return "⏱️ AI sedang load, coba lagi dalam beberapa detik"
