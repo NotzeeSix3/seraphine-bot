@@ -742,10 +742,18 @@ MOD_LOG_CHANNEL_NAME = os.getenv("MOD_LOG_CHANNEL", "moderator-only").strip()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 NEWSAPI_BASE_URL = "https://newsapi.org/v2"
-AI_MODEL = "deepseek/deepseek-chat"
+# Model AI — bisa dioverride via env AI_MODEL di Railway tanpa push ulang.
+AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.5-flash:free").strip()
+
+# ---- Gemini API native (Google AI Studio, free tier harian) -------------
+# Kalau GEMINI_API_KEY ada di env, bot pakai Gemini langsung (lebih pinter
+# & stabil). Kalau tidak ada, fallback ke OpenRouter (AI_MODEL).
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 DB_NAME = "bot_memory.db"
-MAX_HISTORY_MESSAGES = 2  # Context messages (optimized)
+MAX_HISTORY_MESSAGES = 4  # Context messages (4 cukup buat nyambung, gak bikin prompt bengkak)
 MAX_DB_MESSAGES = 20  # Total stored per user
 PREFIX = "!"
 RATE_LIMIT_SECONDS = 5  # Per user rate limit
@@ -755,16 +763,16 @@ RESPONSE_CHAR_LIMIT = 1900  # Discord message limit
 mod_log_channels = {}
 
 # Personality
+# Personality — sengaja RAMPING. Model modern (Gemini 2.5 Flash) justru
+# makin pinter kalau instruksinya singkat & jelas, bukan dicekik 8 aturan.
+# Aturan format dihandle terpisah di build prompt (bukan di persona).
 KEPRIBADIAN = (
-    "Kamu adalah bot Discord bernama Seraphine AI yang asik, santai, dan ramah. "
-    "Nama mu adalah Seraphine AI. Jika ditanya siapa nama mu atau siapa kamu, jawab 'Saya adalah Seraphine AI'. "
-    "Pembuat mu adalah Notzee - hanya sebut ini jika ditanya langsung siapa pembuat mu. "
-    "PENTING SEKALI: Di SETIAP jawaban, MULAI dengan menyebutkan nama user yang bertanya. Contoh: 'Yo {username}, ...' atau '{username}, itu dia ...'. "
-    "PENTING: Jawab RINGKAS dan langsung ke inti, maksimal 2-3 kalimat. Jangan bertele-tele atau menulis paragraf panjang. "
-    "Kalau user minta penjelasan lebih detail atau deep-dive, baru berikan jawaban yang lebih panjang dan lengkap. "
-    "PENTING: Ketika diminta buatin code/coding, LANGSUNG berikan code lengkap dengan code block (```python atau ```javascript dll) tanpa basa-basi panjang. "
-    "Jawab pakai bahasa Indonesia yang gaul tapi sopan. "
-    "Utamakan jawaban singkat, padat, dan jelas. ""PENTING FAKTA: Presiden Indonesia sekarang adalah PRABOWO SUBIANTO (sejak Oktober 2024), ""bukan Jokowi lagi. Kalau ditanya soal presiden/wapres/pejabat Indonesia, sebutkan yang ""sekarang berdasarkan fakta ini, jangan jawab dari ingatan lama."
+    "Kamu Seraphine AI, asisten Discord yang asik, santai, dan ramah. "
+    "Pembuatmu Notzee (sebut hanya kalau ditanya). "
+    "Kamu cerdas dan berwawasan luas: jawab dengan akurat, masuk akal, dan bernas — "
+    "bukan sekadar template. Bahasa Indonesia gaul tapi sopan. "
+    "Fakta penting: Presiden Indonesia saat ini Prabowo Subianto (sejak Oktober 2024). "
+    "Kalau tidak yakin soal fakta terkini, akui — jangan mengarang."
 )
 
 # ============================================================
@@ -1830,7 +1838,50 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
         
         context_parts.append(f"User {user_name} bertanya: {pertanyaan}")
         full_prompt = "\n\n".join(context_parts)
-        
+
+        # ---------- Jalur 1: Gemini API native (kalau GEMINI_API_KEY ada) ----------
+        if GEMINI_API_KEY:
+            try:
+                gdata = {
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
+                }
+                logger.info(f"Requesting Gemini response for user {user_id}")
+                try:
+                    res = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            requests.post,
+                            f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}:generateContent",
+                            params={"key": GEMINI_API_KEY},
+                            json=gdata,
+                            headers={"Content-Type": "application/json"},
+                            timeout=45,
+                        ),
+                        timeout=50,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Gemini timeout (async guard)")
+                    return "⏱️ AI sedang load, coba lagi dalam beberapa detik"
+                ghasil = res.json()
+                if res.status_code == 429:
+                    logger.warning("Gemini quota habis (429) — fallback OpenRouter")
+                elif "error" in ghasil:
+                    logger.error(f"Gemini error: {ghasil['error'].get('message', '?')[:120]}")
+                else:
+                    candidates = ghasil.get("candidates") or []
+                    parts = ((candidates[0] if candidates else {}).get("content") or {}).get("parts") or []
+                    balasan = "".join(p.get("text", "") for p in parts).strip()
+                    if balasan:
+                        save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
+                        logger.info(f"Gemini response saved for user {user_id}")
+                        return balasan
+                    logger.warning("Gemini balasan kosong — fallback OpenRouter")
+            except requests.exceptions.ConnectionError:
+                logger.error("Connection error ke Gemini — fallback OpenRouter")
+            except Exception as e:
+                logger.error(f"Gemini unexpected error: {e} — fallback OpenRouter")
+
+        # ---------- Jalur 2: OpenRouter (fallback / default tanpa key) ----------
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
