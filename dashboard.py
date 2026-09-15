@@ -53,30 +53,25 @@ CONFIG_FILE = "config.json"
 async def startup_event():
     if BOT_IMPORT_SUCCESS and DISCORD_TOKEN:
         def run_bot():
-            # Retry loop: kalau bot crash (gateway block, network, dll),
-            # coba lagi. Kalau tetap mati 5x berturut-turut, matikan
-            # SELURUH service (uvicorn ikut) supaya Railway restart
-            # container — dashboard zombie tanpa bot gak ada gunanya.
+            # discord.py Client.run() gak bisa dipanggil 2x di proses yang
+            # sama (aiohttp session closed => semua retry instan gagal).
+            # Solusi: kalau bot mati, tunggu cooldown lalu RE-EXEC seluruh
+            # proses (fresh client + dashboard). Satu percobaan per cooldown
+            # — sopan, gak perpanjang block rate-limit Discord.
             import time as _time
-            MAX_FAIL = 5
-            fails = 0
-            while fails < MAX_FAIL:
-                try:
-                    print("Starting Discord Bot in background thread...")
-                    client.run(DISCORD_TOKEN)
-                    # client.run return normal = shutdown disengaja
-                    print("Bot shut down normally.")
-                    return
-                except Exception as e:
-                    fails += 1
-                    print(f"Bot error ({fails}/{MAX_FAIL}): {e}")
-                    # backoff sopan: Discord block IP berbasis waktu; nyoba
-                    # terlalu sering malah perpanjang block-nya.
-                    if fails < MAX_FAIL:
-                        wait = min(300 * fails, 900)  # 5m, 10m, 15m, 15m
-                        print(f"Waiting {wait}s before retry (block cooldown)...")
-                        _time.sleep(wait)
-            print("Bot failed 5x — giving up retry; service stays up (dashboard only). Restart manual diperlukan.")
+            import sys as _sys
+            import os as _os
+            COOLDOWN = 300  # 5 menit
+            try:
+                print("Starting Discord Bot in background thread...")
+                client.run(DISCORD_TOKEN)
+                print("Bot shut down normally.")
+                return
+            except Exception as e:
+                print(f"Bot error: {e}")
+                print(f"Re-executing process in {COOLDOWN}s (fresh start, block cooldown)...")
+                _time.sleep(COOLDOWN)
+                _os.execv(_sys.executable, [_sys.executable] + _sys.argv)
 
         bot_thread = threading.Thread(target=run_bot, daemon=True)
         bot_thread.start()
