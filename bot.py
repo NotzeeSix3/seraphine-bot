@@ -762,18 +762,75 @@ MODEL_COOLDOWN = {}
 MODEL_COOLDOWN_SECONDS = 600
 
 # Batas panjang jawaban (makin pendek = makin cepat). Bisa dioverride via env.
-AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "600"))
-GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "800"))
+# CATATAN LATENSI (diukur 2026-09-17): Gemini flash free tier keluarin token
+# pelan kalau di-throttle. maxOutputTokens 800 = sampai ~25 detik nunggu.
+# 400 bikin jawaban 2-3 kalimat tetap muat tapi balasan balik 3x lebih cepat.
+AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "350"))
+GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "400"))
+
+# Budget waktu (detik). Total kasus terburuk = GEMINI_TIMEOUT + (OR_TIMEOUT x jumlah model).
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "15"))
+OR_TIMEOUT = int(os.getenv("OR_TIMEOUT", "12"))
+OR_MAX_MODELS = int(os.getenv("OR_MAX_MODELS", "3"))
 
 # ---- Gemini API native (Google AI Studio, free tier harian) -------------
 # Kalau GEMINI_API_KEY ada di env, bot pakai Gemini langsung (lebih pinter
 # & stabil). Kalau tidak ada, fallback ke OpenRouter (AI_MODEL).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+# Chain model Gemini. Satu model free-tier punya quota SENDIRI, jadi kalau
+# gemini-3.6-flash kena 429 (kuota harian habis), model lain masih jalan.
+# Diukur 2026-09-17 (3.6-flash 429): 3.1-flash-lite 1.9s, flash-lite-latest
+# 1.0s, 3.8-flash 3.8s, 3.5-flash 7.3s. Urutan = kualitas dulu, lite sebagai
+# penyelamat kecepatan.
+GEMINI_MODELS = [
+    m.strip() for m in os.getenv(
+        "GEMINI_MODELS",
+        "gemini-3.6-flash,gemini-flash-lite-latest,gemini-3.1-flash-lite,gemini-3.8-flash"
+    ).split(",") if m.strip()
+]
+GEMINI_COOLDOWN = {}
+GEMINI_COOLDOWN_SECONDS = int(os.getenv("GEMINI_COOLDOWN_SECONDS", "900"))
 # Grounding = Gemini nge-Google jawabannya dulu sebelum jawab (data realtime).
 # Makan quota lebih besar; matikan dengan GEMINI_GROUNDING=0 kalau quota boros.
 GEMINI_GROUNDING = os.getenv("GEMINI_GROUNDING", "1").strip() == "1"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+# ---- Deteksi kebutuhan data realtime -------------------------------------
+# Grounding & pencarian berita itu MAHAL (quota + latensi). Cari berita untuk
+# pertanyaan kayak "apa kabar" cuma bikin prompt bengkak TANPA nambah akurasi.
+# Jadi: nyalain jalur realtime HANYA kalau pertanyaannya sensitif waktu.
+# Isi GEMINI_GROUNDING_MODE: "auto" (default, grounding cuma saat perlu),
+# "on" (selalu), "off" (tidak pernah).
+GEMINI_GROUNDING_MODE = os.getenv("GEMINI_GROUNDING_MODE", "auto").strip().lower()
+
+_REALTIME_HINTS = (
+    "hari ini", "sekarang", "terbaru", "terkini", "terupdate", "update",
+    "berita", "harga", "kurs", "saham", "kripto", "cuaca",
+    "skor", "hasil", "klasemen", "jadwal", "tanding", "pertandingan",
+    "kapan", "siapa", "di mana", "dimana", "berapa",
+    "presiden", "menteri", "gubernur", "pemilu", "politik", "pemerintah",
+    "viral", "trending", "tahun ini", "bulan ini", "minggu ini",
+    "kemarin", "besok", "malam ini", "tadi", "baru saja", "terakhir",
+)
+
+
+def butuh_realtime(teks: str) -> bool:
+    """True kalau pertanyaan kemungkinan butuh data terbaru dari internet."""
+    t = (teks or "").lower()
+    if not t:
+        return False
+    return any(h in t for h in _REALTIME_HINTS)
+
+
+def _grounding_aktif(teks: str) -> bool:
+    """Grounding Google Search: nyala hanya saat mode auto + pertanyaan butuh realtime."""
+    if GEMINI_GROUNDING_MODE == "off":
+        return False
+    if GEMINI_GROUNDING_MODE == "on":
+        return GEMINI_GROUNDING
+    return GEMINI_GROUNDING and butuh_realtime(teks)
+
 
 DB_NAME = "bot_memory.db"
 MAX_HISTORY_MESSAGES = 4  # Context messages (4 cukup buat nyambung, gak bikin prompt bengkak)
@@ -1514,7 +1571,7 @@ def build_help_embed() -> discord.Embed:
     )
     embed.add_field(
         name="ℹ️ Bot Info",
-        value=f"Dibuat oleh: **Notzee**\nNama: **Seraphine AI**\nModel: **{AI_MODEL}**",
+        value=f"Dibuat oleh: **Notzee**\nNama: **Seraphine AI**\nModel: **{(GEMINI_MODELS[0] if GEMINI_API_KEY else AI_MODEL)}**",
         inline=False
     )
     embed.set_footer(text="Ketik / untuk lihat semua slash command")
@@ -1836,7 +1893,9 @@ init_db()
 def save_conversation(user_id: int, user_msg: str, bot_response: str, channel_id: int = 0):
     """Save conversation to database."""
     try:
-        init_db() # Ensure db table exists
+        # init_db() TIDAK dipanggil di sini lagi: itu bikin CREATE TABLE +
+        # commit + log di SETIAP balasan (di jalur panas). Tabel sudah dibuat
+        # sekali saat module load (lihat init_db() tepat di atas).
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
         c.execute('INSERT INTO conversation (user_id, user_message, bot_response, channel_id) VALUES (?, ?, ?, ?)',
@@ -1923,47 +1982,103 @@ def get_user_history(user_id: int, limit: int = MAX_HISTORY_MESSAGES, channel_id
 # ============================================================
 
 NEWS_CACHE = {"time": 0, "text": ""}
-NEWS_CACHE_TTL = 1800  # 30 menit
+NEWS_CACHE_TTL = 900  # 15 menit (dulu 30 — keburu basi buat topik cepat)
 
 _WEB_SEARCH_CACHE = {}  # query -> (timestamp, text)
+# Berita cepat basi. 15 menit bikin jawaban "hari ini" masih nunjuk berita lama.
+WEB_SEARCH_TTL = int(os.getenv("WEB_SEARCH_TTL", "240"))
 
-def fetch_web_context(query: str, max_items: int = 5) -> str:
-    """Cari info TERKINI via Google News RSS (gratis, tanpa API key, cloud-safe).
-    Cache 15 menit per query. Selalu return string (gak pernah throw).
-    Dipakai buat inject fakta realtime ke prompt AI — model apapun punya
-    knowledge cutoff, ini yang bikin jawaban gak basi."""
+
+def _parse_pubdate(teks: str):
+    """Parse pubDate RSS (RFC 822) -> datetime aware, atau None kalau gagal."""
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(teks)
+    except Exception:
+        return None
+
+
+def _gnews_items(query: str, extra: str = "") -> list:
+    """Ambil item Google News RSS buat query + extra operator. Return list dict."""
     import urllib.parse
+    import xml.etree.ElementTree as _ET
+    url = ("https://news.google.com/rss/search?q="
+           + urllib.parse.quote(query + extra) + "&hl=id&gl=ID&ceid=ID:id")
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+    if r.status_code != 200:
+        return []
+    root = _ET.fromstring(r.content)
+    out = []
+    for it in root.iter("item"):
+        judul = (it.findtext("title") or "").strip()
+        if not judul:
+            continue
+        out.append({
+            "judul": judul,
+            "tgl": (it.findtext("pubDate") or "").strip(),
+            "sumber": (it.findtext("source") or "").strip(),
+            "dt": _parse_pubdate((it.findtext("pubDate") or "").strip()),
+        })
+    return out
+
+
+def fetch_web_context(query: str, max_items: int = 4, realtime: bool = True) -> str:
+    """Cari info TERKINI via Google News RSS (gratis, tanpa API key, cloud-safe).
+
+    Kalau realtime=True, pakai operator `when:1d` supaya Google cuma balikin
+    berita <=24 jam dan urutannya yang paling baru dulu. Tanpa filter ini Google
+    balikin artikel lama (kejadian 1-3 hari sebelumnya) — itu sebabnya jawaban
+    bot kelihatan basi. Kalau kosong, fallback: ambil tanpa filter tapi buang
+    item lebih tua dari 5 hari dan urutkan dari yang terbaru.
+    Selalu return string (gak pernah throw)."""
     import time as _time
     q = (query or "").strip()[:120]
     if not q:
         return ""
+    cache_key = f"{q}|1d" if realtime else q
     now = _time.time()
-    hit = _WEB_SEARCH_CACHE.get(q)
-    if hit and (now - hit[0]) < 900:
+    hit = _WEB_SEARCH_CACHE.get(cache_key)
+    if hit and (now - hit[0]) < WEB_SEARCH_TTL:
         return hit[1]
+
     try:
-        import xml.etree.ElementTree as _ET
-        url = ("https://news.google.com/rss/search?q="
-               + urllib.parse.quote(q) + "&hl=id&gl=ID&ceid=ID:id")
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        if r.status_code != 200:
-            return ""
-        root = _ET.fromstring(r.content)
-        items = list(root.iter("item"))[:max_items]
+        items = _gnews_items(q, " when:1d") if realtime else []
+        if not items:
+            items = _gnews_items(q, "")
+        if realtime and items:
+            # Buang item basi (>5 hari). Kalau semua basi, buang semuanya:
+            # lebih baik AI jawab dari pengetahuan sendiri daripada disuapin
+            # berita berbulan-bulan lalu dan dikira "terbaru".
+            from datetime import timezone as _tz
+            cutoff = datetime.now(_tz.utc) - timedelta(days=5)
+            items = [i for i in items if i["dt"] and i["dt"] > cutoff]
+
+        # Urutkan paling baru dulu (item tanpa tanggal ditaruh paling belakang).
+        items.sort(key=lambda i: i["dt"].timestamp() if i["dt"] else 0, reverse=True)
+
         out = []
-        for it in items:
-            judul = (it.findtext("title") or "").strip()
-            tgl = (it.findtext("pubDate") or "").strip()
-            sumber = (it.findtext("source") or "").strip()
-            if judul:
-                out.append(f"- {judul} ({sumber}, {tgl})")
+        for it in items[:max_items]:
+            baris = f"- {it['judul']}"
+            meta = ", ".join(x for x in (it["sumber"], it["tgl"]) if x)
+            if meta:
+                baris += f" ({meta})"
+            out.append(baris)
         teks = "\n".join(out)
         if teks:
-            _WEB_SEARCH_CACHE[q] = (now, teks)
+            _WEB_SEARCH_CACHE[cache_key] = (now, teks)
         return teks
     except Exception as e:
         logger.warning(f"Web search RSS gagal: {str(e)[:60]}")
         return ""
+
+
+def format_tanggal_indo(dt=None) -> str:
+    """Tanggal + jam lengkap format Indonesia, dipakai buat anchor 'hari ini'."""
+    dt = dt or datetime.now()
+    hari = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"][dt.weekday()]
+    bulan = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+             "Agustus", "September", "Oktober", "November", "Desember"][dt.month - 1]
+    return f"{hari}, {dt.day} {bulan} {dt.year} pukul {dt.strftime('%H:%M')} WIB"
 
 def fetch_trending_news() -> str:
     """Ambil berita terkini dari RSS feed Indonesia (gratis, tanpa API key, cloud-safe).
@@ -2025,26 +2140,39 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
     try:
         # Build context
         context_parts = [KEPRIBADIAN]
-        
+
+        # Apakah pertanyaan ini butuh data terbaru dari internet?
+        perlu = butuh_realtime(pertanyaan)
+
         # SELALU inject tanggal real-time biar model tau tahun berapa.
-        now_str = datetime.now().strftime("%d %B %Y, %H:%M")
-        context_parts.append("Tanggal & waktu sekarang: " + now_str + ". Gunakan ini sebagai acuan 'hari ini' buat semua jawaban yang tergantung waktu.")
-        
-        if include_trending:
-            # Jalankan di thread terpisah supaya event loop tetap responsif
+        # Ditaruh di ATAS (paling awal) supaya model gak "lupa" anchor waktunya.
+        context_parts.insert(0, "KONTEKS WAKTU (paling penting): sekarang "
+                                + format_tanggal_indo()
+                                + ". Semua kata 'hari ini', 'sekarang', 'terbaru' "
+                                  "merujuk ke waktu ini, bukan ke masa trainingmu.")
+
+        if include_trending and perlu:
+            # Jalankan di thread terpisah supaya event loop tetap responsif.
+            # Cuma dipanggil kalau pertanyaannya memang butuh info terkini —
+            # nempelin 6 headline ke SEMUA chat bikin prompt bengkak & lambat.
             berita = await asyncio.to_thread(fetch_trending_news)
-            context_parts.append(f"Berita Trending Saat Ini:\n{berita}")
+            if berita:
+                context_parts.append(f"Berita Trending Saat Ini:\n{berita}")
 
         # Web search realtime: cari info terkini soal PERTANYAAN user di
         # Google News, inject hasilnya ke prompt. Ini bikin jawaban gak
-        # basi walau modelnya punya knowledge cutoff lama (Sri Mulyani dsb).
-        web_ctx = await asyncio.to_thread(fetch_web_context, pertanyaan)
-        if web_ctx:
-            context_parts.append(
-                "Hasil pencarian BERITA TERKINI (Google News, pakai ini sebagai "
-                "fakta terbaru; kalau bentrok dengan ingatanmu, PRIORITASKAN "
-                "hasil pencarian ini dan sebut itu info terbaru):\n" + web_ctx
-            )
+        # basi walau modelnya punya knowledge cutoff lama.
+        # Dijalankan HANYA kalau pertanyaannya sensitif waktu — biar chat
+        # biasa (yang gak butuh berita) balas secepat mungkin.
+        if perlu:
+            web_ctx = await asyncio.to_thread(fetch_web_context, pertanyaan, 4, True)
+            if web_ctx:
+                context_parts.append(
+                    "Hasil pencarian BERITA TERKINI (Google News, cuma 24 jam "
+                    "terakhir, urut dari yang paling baru). Pakai ini sebagai fakta "
+                    "terbaru; kalau bentrok dengan ingatanmu, PRIORITASKAN ini dan "
+                    "sebut tanggalnya:\n" + web_ctx
+                )
         
         history = get_user_history(user_id, channel_id=channel_id)
         if history:
@@ -2055,49 +2183,74 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
 
         # ---------- Jalur 1: Gemini API native (kalau GEMINI_API_KEY ada) ----------
         if GEMINI_API_KEY:
-            try:
+            pakai_grounding = _grounding_aktif(pertanyaan)
+            _gnm = time.time()
+            _gem_chain = [GEMINI_MODEL] + [m for m in GEMINI_MODELS if m != GEMINI_MODEL]
+            _gem_live = [m for m in _gem_chain if GEMINI_COOLDOWN.get(m, 0) <= _gnm]
+            if not _gem_live:
+                GEMINI_COOLDOWN.clear()
+                _gem_live = _gem_chain
+            for gmodel in _gem_live:
                 gdata = {
                     "contents": [{"parts": [{"text": full_prompt}]}],
                     "generationConfig": {"temperature": 0.7, "maxOutputTokens": GEMINI_MAX_TOKENS},
                 }
                 # Google Search Grounding: jawaban berbasis hasil pencarian
-                # realtime, bukan cuma ingatan training model.
-                if GEMINI_GROUNDING:
+                # realtime, bukan cuma ingatan training model. Dinyalakan
+                # selektif (lihat _grounding_aktif) biar quota gak jebol.
+                if pakai_grounding:
                     gdata["tools"] = [{"google_search": {}}]
-                logger.info(f"Requesting Gemini response for user {user_id}")
+                logger.info(f"Requesting Gemini ({gmodel}) for user {user_id}"
+                            f" (grounding={'on' if pakai_grounding else 'off'}, max_tok={GEMINI_MAX_TOKENS})")
+                _t0 = time.time()
                 try:
                     res = await asyncio.wait_for(
                         asyncio.to_thread(
                             requests.post,
-                            f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}:generateContent",
+                            f"{GEMINI_BASE_URL}/models/{gmodel}:generateContent",
                             params={"key": GEMINI_API_KEY},
                             json=gdata,
                             headers={"Content-Type": "application/json"},
-                            timeout=45,
+                            timeout=GEMINI_TIMEOUT,
                         ),
-                        timeout=50,
+                        timeout=GEMINI_TIMEOUT + 5,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("Gemini timeout (async guard)")
-                    return "⏱️ AI sedang load, coba lagi dalam beberapa detik"
-                ghasil = res.json()
+                    logger.warning(f"Gemini timeout: {gmodel} (>{GEMINI_TIMEOUT}s)")
+                    GEMINI_COOLDOWN[gmodel] = time.time() + GEMINI_COOLDOWN_SECONDS
+                    continue
+                except requests.exceptions.ConnectionError:
+                    logger.error("Connection error ke Gemini — fallback OpenRouter")
+                    break
+                except Exception as e:
+                    logger.error(f"Gemini error {gmodel}: {str(e)[:80]}")
+                    GEMINI_COOLDOWN[gmodel] = time.time() + GEMINI_COOLDOWN_SECONDS
+                    continue
+                try:
+                    ghasil = res.json()
+                except Exception:
+                    GEMINI_COOLDOWN[gmodel] = time.time() + GEMINI_COOLDOWN_SECONDS
+                    continue
                 if res.status_code == 429:
-                    logger.warning("Gemini quota habis (429) — fallback OpenRouter")
-                elif "error" in ghasil:
-                    logger.error(f"Gemini error: {ghasil['error'].get('message', '?')[:120]}")
-                else:
-                    candidates = ghasil.get("candidates") or []
-                    parts = ((candidates[0] if candidates else {}).get("content") or {}).get("parts") or []
-                    balasan = "".join(p.get("text", "") for p in parts).strip()
-                    if balasan:
-                        save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
-                        logger.info(f"Gemini response saved for user {user_id}")
-                        return balasan
-                    logger.warning("Gemini balasan kosong — fallback OpenRouter")
-            except requests.exceptions.ConnectionError:
-                logger.error("Connection error ke Gemini — fallback OpenRouter")
-            except Exception as e:
-                logger.error(f"Gemini unexpected error: {e} — fallback OpenRouter")
+                    logger.warning(f"Gemini quota habis 429: {gmodel} — cooldown, coba model Gemini lain")
+                    GEMINI_COOLDOWN[gmodel] = time.time() + GEMINI_COOLDOWN_SECONDS
+                    continue
+                if "error" in ghasil:
+                    logger.error(f"Gemini error ({gmodel}): {str(ghasil['error'].get('message', '?'))[:120]}")
+                    GEMINI_COOLDOWN[gmodel] = time.time() + GEMINI_COOLDOWN_SECONDS
+                    continue
+                candidates = ghasil.get("candidates") or []
+                parts = ((candidates[0] if candidates else {}).get("content") or {}).get("parts") or []
+                balasan = "".join(p.get("text", "") for p in parts).strip()
+                if balasan:
+                    GEMINI_COOLDOWN.pop(gmodel, None)
+                    save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
+                    logger.info(f"Gemini response saved for user {user_id} "
+                                f"in {round(time.time() - _t0, 2)}s via {gmodel} "
+                                f"(out_tok={ghasil.get('usageMetadata', {}).get('candidatesTokenCount', '?')})")
+                    return balasan
+                logger.warning(f"Gemini balasan kosong ({gmodel}) — coba model Gemini lain")
+                GEMINI_COOLDOWN[gmodel] = time.time() + GEMINI_COOLDOWN_SECONDS
 
         # ---------- Jalur 2: OpenRouter (fallback / default tanpa key) ----------
         headers = {
@@ -2120,6 +2273,9 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             models_to_try = _fresh
         else:
             MODEL_COOLDOWN.clear()  # semua kena cooldown -> reset, coba dari awal
+        # Cap jumlah model: tiap model yang mati makan OR_TIMEOUT detik. Tanpa cap,
+        # 6 model mati = user nunggu >1 menit buat dapet pesan error.
+        models_to_try = models_to_try[:OR_MAX_MODELS]
         last_error = "no model tried"
 
         for model in models_to_try:
@@ -2130,6 +2286,7 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
                 "max_tokens": AI_MAX_TOKENS,  # dibatasi biar jawaban gak kepanjangan (lambat)
             }
             logger.info(f"Requesting AI response for user {user_id} (model: {model})")
+            _t0 = time.time()
             try:
                 res = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -2137,12 +2294,12 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
                         f"{OPENROUTER_BASE_URL}/chat/completions",
                         json=data,
                         headers=headers,
-                        timeout=30
+                        timeout=OR_TIMEOUT
                     ),
-                    timeout=35
+                    timeout=OR_TIMEOUT + 4
                 )
             except (asyncio.TimeoutError, requests.exceptions.Timeout):
-                logger.warning(f"OpenRouter timeout: {model}")
+                logger.warning(f"OpenRouter timeout: {model} ({round(time.time()-_t0,2)}s)")
                 MODEL_COOLDOWN[model] = time.time() + MODEL_COOLDOWN_SECONDS
                 last_error = f"{model}: timeout"
                 continue
@@ -2164,7 +2321,8 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             if balasan:
                 MODEL_COOLDOWN.pop(model, None)
                 save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
-                logger.info(f"Response saved for user {user_id} (via {model})")
+                logger.info(f"Response saved for user {user_id} (via {model}, "
+                            f"{round(time.time()-_t0,2)}s)")
                 return balasan
             # jawaban kosong = model aneh, lanjut model berikutnya
             MODEL_COOLDOWN[model] = time.time() + MODEL_COOLDOWN_SECONDS
