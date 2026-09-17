@@ -385,6 +385,36 @@ HTML_TEMPLATE = """
 </html>
 """
 
+@app.get("/ai-latency")
+async def ai_latency(request: Request, q: str = "siapa presiden indonesia sekarang"):
+    """Health-check AI: ukur latensi + lihat jawaban, dari server produksi.
+
+    Pakai buat mastiin bot gak lagi lemot / jawabannya gak basi, tanpa perlu
+    nunggu orang ngobrol di Discord. Auth: Basic sama kayak dashboard.
+    Contoh: curl -u admin:PASS https://<domain>/ai-latency?q=harga+beras+hari+ini
+    """
+    if not _authorized(request):
+        return _deny()
+    import time as _t
+    try:
+        from bot import tanya_ai, butuh_realtime, GEMINI_COOLDOWN, GEMINI_MODEL, GEMINI_MODELS
+    except Exception as e:
+        return {"error": f"bot import gagal: {e}"}
+    t0 = _t.time()
+    try:
+        jawaban = await tanya_ai(q, 1, "selftest", include_trending=True, channel_id=0)
+    except Exception as e:
+        return {"error": str(e)[:200], "seconds": round(_t.time() - t0, 2)}
+    return {
+        "pertanyaan": q,
+        "seconds": round(_t.time() - t0, 2),
+        "butuh_realtime": butuh_realtime(q),
+        "jawaban": jawaban[:500],
+        "gemini_chain": [GEMINI_MODEL] + [m for m in GEMINI_MODELS if m != GEMINI_MODEL],
+        "gemini_cooldown": sorted(GEMINI_COOLDOWN.keys()),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     if not _authorized(request):
