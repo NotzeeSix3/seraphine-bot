@@ -33,6 +33,7 @@ from collections import defaultdict
 import time
 import traceback
 from better_profanity import profanity
+from better_profanity.better_profanity import read_wordlist as _bp_read_wordlist
 
 # ============================================================
 #  MUSIC PLAYER CONFIG
@@ -802,34 +803,172 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================
-#  PROFANITY FILTER SETUP
+#  FILTER KATA KASAR
+#  Prinsip: cocok PER-KATA (bukan substring) + tahan tulisan alay.
+#  Efeknya: "babi" TIDAK kena di "babin"/"babinsa", tapi "goblok",
+#  "gobloknya", "anjiiing", "k0nt0l" tetap kena.
 # ============================================================
 
-profanity.load_censor_words()
+# Istilah identitas (orientasi seksual / gender) ada di wordlist bawaan
+# better_profanity tapi BUKAN kata kasar -> dibuang dari daftar.
+EXEMPT_IDENTITY_WORDS = {
+    "gay", "gays", "gayest", "homo", "homos", "homosexual", "homosexuality",
+    "queer", "fag", "fags", "faggot", "faggots", "lesbian", "lesbians",
+    "dyke", "dykes", "tranny", "trannies", "shemale", "shemales",
+    "bisexual", "bisexuals", "trans", "transgender",
+}
 
-# Custom toxic keywords untuk Indonesia
+# Wordlist Inggris (dari better_profanity, sudah termasuk bentuk alay seperti
+# "sh1t" / "he11") minus istilah identitas di atas.
+try:
+    _EN_WORDLIST = [
+        str(w).strip().lower() for w in _bp_read_wordlist(profanity._default_wordlist_filename)
+        if str(w).strip() and str(w).strip().lower() not in EXEMPT_IDENTITY_WORDS
+    ]
+except Exception as _e:  # kalau file wordlist hilang, filter Indonesia tetap jalan
+    print(f"[WARN] Gagal baca wordlist better_profanity: {_e}")
+    _EN_WORDLIST = []
+
+# Root kata kasar Indonesia. Dicek per-kata, jadi tidak lagi salah tangkap.
 CUSTOM_TOXIC_WORDS = [
-    "anjing", "babi", "monyet", "setan", "bangsat", "kontol", "memek", 
+    "anjing", "babi", "monyet", "setan", "bangsat", "kontol", "memek",
     "biadab", "tolol", "dungu", "goblok", "bodoh", "sampah", "hina",
-    "jelek", "buruk", "sial", "sinting", "sarap"
+    "jelek", "buruk", "sial", "sinting", "sarap",
 ]
 
-# Add custom words to profanity filter
-profanity.add_censor_words(CUSTOM_TOXIC_WORDS)
+# Singkatan kasar khas chat. Tambah/hapus bebas sesuai kebutuhan server.
+EXTRA_TOXIC_ABBREV = [
+    "anjg", "anjir", "bgst", "bngst", "gblk", "bgsd", "tll", "kntl", "kontl", "ppek",
+]
+
+# Pintu darurat: kata yang ada di wordlist Inggris tapi di bahasa Indonesia
+# artinya aman. Tambah di sini kalau nanti ada salah tangkap lain.
+ALLOWED_WORDS = {
+    "massa",   # massa jenis / massa otot
+    "dong",    # partikel ajakan: "bantuin dong"
+}
+
+# Imbuhan Indonesia yang boleh nempel di root:
+# goblok -> gobloknya, menghina -> hina (root tetap ke-detect).
+_ID_SUFFIXES_RAW = ("nya", "kah", "lah", "deh", "dong", "sih", "pun", "mu", "ku", "an", "kan", "in", "i")
+_ID_PREFIXES_RAW = ("meng", "menge", "men", "mem", "nge", "di", "ter", "ke", "se", "ber", "peng", "pen")
+
+# --- normalisasi -----------------------------------------------------------
+# Kata Indonesia: angka/simbol alay dibuka jadi huruf (k0nt0l -> kontol).
+_LEET_MAP = str.maketrans({
+    "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b",
+    "@": "a", "$": "s", "!": "i", "|": "i", "+": "t",
+})
+_REPEATED = re.compile(r"(.)\1+")
+_CHUNKS = re.compile(r"[a-z0-9]+(?:[._\-*][a-z0-9]+)*")
+_INNER = re.compile(r"[^a-z0-9]+")
+_EN_ENTRY_OK = re.compile(r"[a-z0-9\- ]+")   # entri ber-tanda baca aneh dilewati
+_MASK_CHARS = "*_"
+_VOWELS = "aiueo"
+_MAX_MASK_VARIANTS = 32
+
+
+def _squash(text: str) -> str:
+    """Rapatkan huruf berulang: anjiiing -> anjing."""
+    return _REPEATED.sub(r"\1", text.lower())
+
+
+def _normalize_id(text: str) -> str:
+    """Versi kata Indonesia: alay dibuka + huruf berulang dirapatkan."""
+    return _squash(text.translate(_LEET_MAP))
+
+
+def _en_forms(text: str):
+    """Bentuk yang dianggap sama untuk wordlist Inggris: apa adanya + versi alay."""
+    low = text.lower()
+    return {_INNER.sub("", low), _INNER.sub("", low.translate(_LEET_MAP))}
+
+
+_EN_SET = set()
+for _w in _EN_WORDLIST:
+    if _EN_ENTRY_OK.fullmatch(_w) and len(_INNER.sub("", _w)) >= 3:
+        _EN_SET |= _en_forms(_w)
+# istilah identitas juga dibuang dalam bentuk alay (biar "h0m0" tidak kena)
+for _w in EXEMPT_IDENTITY_WORDS:
+    _EN_SET -= _en_forms(_w)
+_EN_SET.discard("")
+_ALLOWED_EN = set()
+for _w in ALLOWED_WORDS:
+    _ALLOWED_EN |= _en_forms(_w)
+_ALLOWED_ID = {_normalize_id(w) for w in ALLOWED_WORDS}
+_TOXIC_SET = (
+    {_normalize_id(w) for w in CUSTOM_TOXIC_WORDS}
+    | {_normalize_id(w) for w in EXTRA_TOXIC_ABBREV}
+)
+_ID_SUFFIXES = tuple(_normalize_id(s) for s in _ID_SUFFIXES_RAW)
+_ID_PREFIXES = tuple(_normalize_id(p) for p in _ID_PREFIXES_RAW)
+
+
+def _roots_of(token: str):
+    """Kandidat root dari satu kata: apa adanya, lalu tanpa imbuhan depan/belakang."""
+    yield token
+    for p in _ID_PREFIXES:
+        if token.startswith(p) and len(token) - len(p) >= 3:
+            stem = token[len(p):]
+            yield stem
+            for s in _ID_SUFFIXES:
+                if stem.endswith(s) and len(stem) - len(s) >= 3:
+                    yield stem[: -len(s)]
+    for s in _ID_SUFFIXES:
+        if token.endswith(s) and len(token) - len(s) >= 3:
+            yield token[: -len(s)]
+
+
+def _is_toxic_token(token: str) -> bool:
+    """Cek satu kata: cocok mentah, atau cocok setelah imbuhan dibuang."""
+    if not token or token in _ALLOWED_ID:
+        return False
+    if token in _TOXIC_SET:
+        return True
+    return any(root in _TOXIC_SET for root in _roots_of(token))
+
+
+def _mask_variants(chunk: str, limit: int = _MAX_MASK_VARIANTS):
+    """Kembalikan kemungkinan isi kata bertopeng: f*ck -> fack/feck/fick/fock/fuck."""
+    if not any(c in chunk for c in _MASK_CHARS):
+        return (chunk,)
+    variants = [""]
+    for ch in chunk:
+        if ch in _MASK_CHARS:
+            variants = [v + vowel for v in variants for vowel in _VOWELS]
+        else:
+            variants = [v + ch for v in variants]
+        if len(variants) > limit:
+            return (chunk.replace("*", "").replace("_", ""),)
+    return tuple(variants)
+
 
 def contains_toxic(text: str) -> bool:
-    """Check if text contains toxic content (hybrid method)."""
-    text_lower = text.lower()
-    
-    # Method 1: better-profanity library check
-    if profanity.contains_profanity(text):
-        return True
-    
-    # Method 2: Custom keyword check
-    for word in CUSTOM_TOXIC_WORDS:
-        if word in text_lower:
-            return True
-    
+    """Cek apakah teks mengandung kata kasar (wordlist Inggris + kata Indonesia)."""
+    if not text:
+        return False
+
+    # Dua sumber: teks apa adanya (kata Inggris tetap utuh, mis. "sh1t") dan
+    # teks yang sudah dibuka alay-nya (mis. "@njing" -> "anjing").
+    for source in (text.lower(), _normalize_id(text)):
+        previous = None
+        for match in _CHUNKS.finditer(source):
+            plain = None
+            for candidate in _mask_variants(match.group(0)):
+                compact = _INNER.sub("", candidate)
+                if len(compact) < 3:
+                    continue
+                # kata Inggris (dicek per-kata, termasuk frasa 2 kata)
+                if compact not in _ALLOWED_EN:
+                    if compact in _EN_SET or (previous and previous + compact in _EN_SET):
+                        return True
+                # kata Indonesia (imbuhan dibuang)
+                if _is_toxic_token(_normalize_id(candidate)):
+                    return True
+                if plain is None:
+                    plain = compact
+            previous = plain
+
     return False
 
 async def get_or_create_mod_log_channel(guild: discord.Guild) -> discord.TextChannel:
@@ -2224,11 +2363,20 @@ async def on_message(pesan):
         return
     
     cfg = load_bot_config()
+    exempt_mods = cfg.get("automod_exempt_mods", True)
 
     # ============================================================
-    #  TOXIC MESSAGE AUTO-DELETE (SEMUA MESSAGE)
+    #  TOXIC MESSAGE AUTO-DELETE
+    #  - Hanya di server (DM tidak bisa dihapus & tidak ada mod log)
+    #  - Mod/admin dikecualikan: kalau bot tidak punya izin hapus pesannya,
+    #    bot jangan malah reply publik di channel
     # ============================================================
-    if cfg.get("automod_enabled", True) and contains_toxic(pesan.content):
+    if (
+        pesan.guild
+        and cfg.get("automod_enabled", True)
+        and not (exempt_mods and is_moderator(pesan.author))
+        and contains_toxic(pesan.content)
+    ):
         logger.warning(f"Toxic message detected from {pesan.author.name}: {pesan.content[:50]}")
         
         try:
