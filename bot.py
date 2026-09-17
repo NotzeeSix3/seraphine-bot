@@ -747,13 +747,23 @@ NEWSAPI_BASE_URL = "https://newsapi.org/v2"
 # Fallback OpenRouter. Free pool OpenRouter itu FLAPPY: model hidup, timeout,
 # 429, gantian tiap jam (tested 2026-09-15: nemotron-ultra timeout, gemma 429
 # menit kemudian). Maka pakai CHAIN: coba model berurutan sampai ada yang jawab.
-AI_MODEL = os.getenv("AI_MODEL", "google/gemma-4-31b-it:free").strip()
+AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-super-120b-a12b:free").strip()
 AI_FALLBACK_MODELS = [
     m.strip() for m in os.getenv(
         "AI_FALLBACK_MODELS",
-        "google/gemma-4-31b-it:free,nvidia/nemotron-3-super-120b-a12b:free,z-ai/glm-5.2:free,inclusionai/ling-3.0-flash-vl:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free"
+        "nvidia/nemotron-3-super-120b-a12b:free,inclusionai/ling-3.0-flash-vl:free,google/gemma-4-31b-it:free,z-ai/glm-5.2:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free"
     ).split(",") if m.strip()
 ]
+
+# Model yang baru gagal (429/timeout/kosong) di-skip sementara biar tiap pesan
+# gak buang ~1 detik ngecek model yang emang lagi mati. Diukur 2026-09-17:
+# gemma-4-31b & glm-5.2 konsisten 429, sedangkan nemotron-super & ling-flash jalan.
+MODEL_COOLDOWN = {}
+MODEL_COOLDOWN_SECONDS = 600
+
+# Batas panjang jawaban (makin pendek = makin cepat). Bisa dioverride via env.
+AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "600"))
+GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "800"))
 
 # ---- Gemini API native (Google AI Studio, free tier harian) -------------
 # Kalau GEMINI_API_KEY ada di env, bot pakai Gemini langsung (lebih pinter
@@ -784,6 +794,8 @@ KEPRIBADIAN = (
     "Pembuatmu Notzee (sebut hanya kalau ditanya). "
     "Kamu cerdas dan berwawasan luas: jawab dengan akurat, masuk akal, dan bernas — "
     "bukan sekadar template. Bahasa Indonesia gaul tapi sopan. "
+    "Jawab RINGKAS: 2-3 kalimat sebagai default. Kalau usernya minta detail/panjang/"
+    "jelasin lengkap, baru keluar versi panjang. Kode tetap boleh ditulis penuh. "
     "Fakta penting: Presiden Indonesia saat ini Prabowo Subianto (sejak Oktober 2024). "
     "Kalau tidak yakin soal fakta terkini, akui — jangan mengarang."
 )
@@ -2046,7 +2058,7 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             try:
                 gdata = {
                     "contents": [{"parts": [{"text": full_prompt}]}],
-                    "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
+                    "generationConfig": {"temperature": 0.7, "maxOutputTokens": GEMINI_MAX_TOKENS},
                 }
                 # Google Search Grounding: jawaban berbasis hasil pencarian
                 # realtime, bukan cuma ingatan training model.
@@ -2098,6 +2110,16 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
         # Chain: free pool OpenRouter flappy (429/timeout gantian), jadi coba
         # beberapa model berurutan sampai ada yang jawab.
         models_to_try = [AI_MODEL] + [m for m in AI_FALLBACK_MODELS if m != AI_MODEL]
+        # Skip model yang lagi cooldown (baru 429/timeout) biar gak buang waktu tiap pesan.
+        _now = time.time()
+        _fresh = [m for m in models_to_try if MODEL_COOLDOWN.get(m, 0) <= _now]
+        if _fresh:
+            _skipped = [m for m in models_to_try if m not in _fresh]
+            if _skipped:
+                logger.info("Skip model cooldown: " + ", ".join(_skipped))
+            models_to_try = _fresh
+        else:
+            MODEL_COOLDOWN.clear()  # semua kena cooldown -> reset, coba dari awal
         last_error = "no model tried"
 
         for model in models_to_try:
@@ -2105,7 +2127,7 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
                 "model": model,
                 "messages": [{"role": "user", "content": full_prompt}],
                 "temperature": 0.7,
-                "max_tokens": 4000,  # cukup buat reasoning models
+                "max_tokens": AI_MAX_TOKENS,  # dibatasi biar jawaban gak kepanjangan (lambat)
             }
             logger.info(f"Requesting AI response for user {user_id} (model: {model})")
             try:
@@ -2121,10 +2143,12 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
                 )
             except (asyncio.TimeoutError, requests.exceptions.Timeout):
                 logger.warning(f"OpenRouter timeout: {model}")
+                MODEL_COOLDOWN[model] = time.time() + MODEL_COOLDOWN_SECONDS
                 last_error = f"{model}: timeout"
                 continue
             except requests.exceptions.ConnectionError:
                 logger.warning(f"Connection error: {model}")
+                MODEL_COOLDOWN[model] = time.time() + MODEL_COOLDOWN_SECONDS
                 last_error = f"{model}: connection"
                 continue
 
@@ -2132,15 +2156,18 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
             if "error" in hasil:
                 error_msg = hasil["error"].get("message", "Unknown error")
                 logger.warning(f"OpenRouter error ({model}): {error_msg[:80]}")
+                MODEL_COOLDOWN[model] = time.time() + MODEL_COOLDOWN_SECONDS
                 last_error = f"{model}: {error_msg[:60]}"
-                continue  # model mati/limit — coba model berikutnya
+                continue  # model mati/limit — coba model berikutnya, skip sementara
 
             balasan = hasil.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if balasan:
+                MODEL_COOLDOWN.pop(model, None)
                 save_conversation(user_id, pertanyaan, balasan, channel_id=channel_id)
                 logger.info(f"Response saved for user {user_id} (via {model})")
                 return balasan
             # jawaban kosong = model aneh, lanjut model berikutnya
+            MODEL_COOLDOWN[model] = time.time() + MODEL_COOLDOWN_SECONDS
             last_error = f"{model}: empty response"
 
         logger.error(f"Semua model gagal: {last_error}")
