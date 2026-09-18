@@ -264,9 +264,11 @@ def try_read_link(teks: str):
     isi, err = fetch_page_text(url)
     if isi is None:
         return (f"🔗 Gak bisa buka link itu bro ({err}).", url)
-    if len(isi) < 200:
-        return ("🔗 Halamannya kebuka tapi isinya tipis banget, "
-                "kemungkinan butuh login atau JS berat. Coba jelasin aja isinya apa.", url)
+    # Ambang tipis = 60 char. Halaman valid sering pendek (example.com = 142
+    # char) — ambang 200 bikin halaman sah dituduh "butuh login".
+    if len(isi) < 60:
+        return ("�� Halamannya kebuka tapi teksnya kosong — kemungkinan butuh "
+                "login atau isinya di-render pakai JS. Coba jelasin aja isinya apa.", url)
     pertanyaan = _URL_RE.sub("", teks).strip()
     ringkas = _gemini_summarize(isi, url, pertanyaan)
     if not ringkas:
