@@ -35,6 +35,8 @@ import traceback
 from better_profanity import profanity
 from better_profanity.better_profanity import read_wordlist as _bp_read_wordlist
 
+from cortex import cortex_handle
+
 # ============================================================
 #  MUSIC PLAYER CONFIG
 # ============================================================
@@ -1551,6 +1553,13 @@ def build_help_embed() -> discord.Embed:
         inline=False
     )
     embed.add_field(
+        name="🧠 Cortex Tools (langsung ketik, tanpa command)",
+        value="`25 x 4`, `17% dari 200`, `akar 144` - Kalkulator\n"
+              "`https://...` di pesan - Baca & rangkum link\n"
+              "`gambar kucing lucu` - Bikin gambar",
+        inline=False
+    )
+    embed.add_field(
         name="🎵 Musik (Slash)",
         value="`/splay` - Putar dari YouTube / Spotify\n`/squeue` - Lihat antrean\n`/sskip` - Lewati lagu\n"
               "`/spause` - Pause\n`/sresume` - Resume\n`/sloop` - Loop lagu\n`/sshuffle` - Acak antrean\n"
@@ -2080,6 +2089,61 @@ def format_tanggal_indo(dt=None) -> str:
              "Agustus", "September", "Oktober", "November", "Desember"][dt.month - 1]
     return f"{hari}, {dt.day} {bulan} {dt.year} pukul {dt.strftime('%H:%M')} WIB"
 
+
+# ---- Pembersih query pencarian -------------------------------------------
+# Google News itu mesin pencari ARTIKEL, bukan penjawab pertanyaan. Query
+# "siapa menkeu indonesia sekarang" cuma balikin artikel OPINI soal pergantian
+# pejabat, bukan fakta "Suahasil Nazara dilantik jadi Menkeu". Query "menteri
+# keuangan indonesia" balikin faktanya. Jadi buang kata tanya + singkatan.
+_QUERY_STOPWORDS = {
+    "siapa", "apa", "apakah", "kapan", "dimana", "mana", "berapa", "bagaimana",
+    "kenapa", "mengapa", "yang", "dan", "atau", "itu", "ini", "sekarang",
+    "hari", "terbaru", "terkini", "terupdate", "dong", "ya", "nih", "sih",
+    "kah", "deh", "gitu", "aja", "saja", "tolong", "coba", "bro", "bang",
+    "min", "kak", "gua", "gue", "aku", "saya", "kamu", "lu", "lo", "bot",
+    "seraphine", "adalah", "sebutkan", "jelaskan", "info", "kabar", "tentang",
+    "soal", "mengenai", "pada", "untuk", "dari", "ke", "di", "adakah",
+    "benar", "bener", "emang", "memang", "sih", "kalian", "kita", "sini",
+    "tau", "tahu", "gak", "ga", "tidak", "nggak", "engga", "tadi", "malam",
+    "pagi", "siang", "sore", "kemarin", "besok", "dulu", "lagi", "udah",
+    "sudah", "belum", "punya", "ada", "gimana", "kok", "kan", "lah",
+}
+# Singkatan berita -> bentuk panjang (kunci multi-kata duluan biar gak setengah ganti).
+_QUERY_ALIASES = {
+    "presiden ri": "presiden indonesia",
+    "menteri keuangan": "menteri keuangan",
+    "menkeu": "menteri keuangan",
+    "menhan": "menteri pertahanan",
+    "menlu": "menteri luar negeri",
+    "mendag": "menteri perdagangan",
+    "menteri": "menteri",
+    "kapolri": "kapolri",
+    "prabowo": "prabowo subianto",
+    "jokowi": "joko widodo",
+}
+
+
+def build_search_query(teks: str, maks_kata: int = 6) -> str:
+    """Ubah pertanyaan user jadi query berita yang efektif.
+
+    'siapa menkeu indonesia sekarang' -> 'menteri keuangan indonesia'
+    Kosong/gagal -> balikin teks aslinya (biar tetap ada yang dicari).
+    """
+    asli = (teks or "").strip()
+    if not asli:
+        return ""
+    bersih = re.sub(r"[^\w\s]", " ", asli.lower())
+    kata = [w for w in bersih.split() if w and w not in _QUERY_STOPWORDS]
+    if not kata:
+        return asli[:120]
+    q = " ".join(kata[:maks_kata])
+    # Alias: frasa panjang dulu supaya "presiden ri" gak jadi "presiden indonesia"
+    # setelah "menteri keuangan" keburu ke-substitusi.
+    for kunci in sorted(_QUERY_ALIASES, key=len, reverse=True):
+        q = re.sub(rf"\b{re.escape(kunci)}\b", _QUERY_ALIASES[kunci], q)
+    return q.strip()[:120]
+
+
 def fetch_trending_news() -> str:
     """Ambil berita terkini dari RSS feed Indonesia (gratis, tanpa API key, cloud-safe).
     SELALU mengembalikan string (gak pernah throw), cache 30 menit."""
@@ -2165,13 +2229,14 @@ async def tanya_ai(pertanyaan: str, user_id: int, user_name: str, include_trendi
         # Dijalankan HANYA kalau pertanyaannya sensitif waktu — biar chat
         # biasa (yang gak butuh berita) balas secepat mungkin.
         if perlu:
-            web_ctx = await asyncio.to_thread(fetch_web_context, pertanyaan, 4, True)
+            q_cari = build_search_query(pertanyaan)
+            web_ctx = await asyncio.to_thread(fetch_web_context, q_cari, 5, True)
             if web_ctx:
                 context_parts.append(
-                    "Hasil pencarian BERITA TERKINI (Google News, cuma 24 jam "
-                    "terakhir, urut dari yang paling baru). Pakai ini sebagai fakta "
-                    "terbaru; kalau bentrok dengan ingatanmu, PRIORITASKAN ini dan "
-                    "sebut tanggalnya:\n" + web_ctx
+                    "Hasil pencarian BERITA TERKINI (Google News, kueri: "
+                    + q_cari + ", cuma 24 jam terakhir, urut dari yang paling "
+                    "baru). Pakai ini sebagai fakta terbaru; kalau bentrok dengan "
+                    "ingatanmu, PRIORITASKAN ini dan sebut tanggalnya:\n" + web_ctx
                 )
         
         history = get_user_history(user_id, channel_id=channel_id)
@@ -2774,6 +2839,27 @@ async def on_message(pesan):
     # ============================================================
     if not cfg.get("ai_chat_enabled", True):
         return
+
+    # ---- CORTEX TOOLS: kalkulator / baca link / bikin gambar ----
+    # Dicek SEBELUM jalur AI biasa. Kalau bukan tugas tools -> None ->
+    # lanjut ke tanya_ai seperti biasa. Kalau Cortex gagal internal,
+    # dia balikin None juga (fail-open), jadi chat gak pernah macet.
+    if cfg.get("cortex_enabled", True):
+        try:
+            hasil_cortex = await cortex_handle(pertanyaan)
+        except Exception as _cx:
+            logger.error(f"Cortex handle error: {_cx}")
+            hasil_cortex = None
+        if hasil_cortex:
+            if hasil_cortex.get("image_url"):
+                embed = discord.Embed(description=hasil_cortex["text"],
+                                      color=0x7289da, timestamp=datetime.now())
+                embed.set_image(url=hasil_cortex["image_url"])
+                await pesan.reply(embed=embed)
+            else:
+                jawaban = truncate_response(hasil_cortex["text"])
+                await pesan.reply(embed=create_response_embed("💬 Jawaban", jawaban))
+            return
 
     async with pesan.channel.typing():
         jawaban = await tanya_ai(pertanyaan, pesan.author.id, pesan.author.name, include_trending=True, channel_id=pesan.channel.id)
