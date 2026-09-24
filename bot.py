@@ -208,6 +208,54 @@ def _extract_info_with_fallback(url, download):
                 continue
     raise last_err
 
+def _get_yt_oembed_title(yt_url):
+    """Ambil judul video YouTube via oEmbed publik (tidak pernah kena bot-check)."""
+    import urllib.request, urllib.parse, json
+    try:
+        api_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(yt_url, safe=':/?=')}&format=json"
+        req = urllib.request.Request(api_url, headers={'User-Agent': _FFMPEG_UA})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            res = json.loads(r.read().decode('utf-8'))
+            return res.get('title')
+    except Exception as e:
+        ytdl_log.warning(f"oEmbed YouTube gagal untuk {yt_url}: {e}")
+        return None
+
+
+def _clean_track_title(title):
+    """Bersihkan noise umum di judul YouTube video supaya pencarian audio akurat."""
+    if not title:
+        return ""
+    cleaned = re.sub(r'\([^)]*(?:official|video|audio|lyric|visualizer|mv|hd|4k|clip)[^)]*\)', '', title, flags=re.I)
+    cleaned = re.sub(r'\[[^\]]*(?:official|video|audio|lyric|visualizer|mv|hd|4k|clip)[^\]]*\]', '', cleaned, flags=re.I)
+    cleaned = re.sub(r'\s*\|\s*.*$', '', cleaned)
+    return cleaned.strip()
+
+
+def _extract_from_soundcloud(query, download=True):
+    """Ekstraksi fallback audio via SoundCloud (bebas bot-check & aman di IP datacenter)."""
+    sc_query = f"scsearch1:{query}"
+    ytdl_log.info(f"[music-fallback] Mencoba SoundCloud search: {sc_query}")
+    try:
+        data = ytdl.extract_info(sc_query, download=download)
+        if data and data.get('entries'):
+            data = data['entries'][0]
+        if not data:
+            return None, None
+        fn = None
+        if download:
+            fn = (data.get('filepath')
+                  or data.get('_filename')
+                  or ytdl.prepare_filename(data))
+            if fn and os.path.exists(fn):
+                return data, fn
+        if data.get('url'):
+            return data, None
+    except Exception as e:
+        ytdl_log.warning(f"[music-fallback] SoundCloud gagal ({query}): {e}")
+    return None, None
+
+
 def _build_ffmpeg_options(data=None):
     """Bangun opsi ffmpeg. Kalau data punya http_headers dari yt-dlp,
     pakai header itu (Cookie/Referer/UA) supaya googlevideo.com tidak 403."""
@@ -216,10 +264,13 @@ def _build_ffmpeg_options(data=None):
     # User-Agent
     ua = hdrs.get('User-Agent') or _FFMPEG_UA
     before += f' -user_agent "{ua}"'
-    # Header tambahan yang sering wajib buat googlevideo
+    # Header tambahan yang sering wajib buat googlevideo / stream
     extra = []
+    extractor = ((data or {}).get('extractor') or '').lower()
     if hdrs.get('Referer'):
         extra.append(f'Referer: {hdrs["Referer"]}')
+    elif 'soundcloud' in extractor:
+        extra.append('Referer: https://soundcloud.com/')
     else:
         extra.append('Referer: https://www.youtube.com/')
     if hdrs.get('Cookie'):
@@ -229,7 +280,9 @@ def _build_ffmpeg_options(data=None):
     extra.append('Accept: */*')
     extra.append('Accept-Language: en-US,en;q=0.9')
     if extra:
-        joined = '\r\n'.join(extra) + '\r\n'
+        joined = "\
+\\n".join(extra) + "\
+\\n"
         before += f' -headers "{joined}"'
     return {'options': '-vn', 'before_options': before}
 
@@ -241,55 +294,97 @@ class YTDLSource(discord.PCMVolumeTransformer):
         super().__init__(source, volume)
         self.data = data
         self.title = data.get('title')
-        self.url = data.get('url')
+        self.url = data.get('webpage_url') or data.get('url')
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False):
         loop = loop or asyncio.get_event_loop()
 
-        if not url.startswith(('http://', 'https://', 'www.')):
-            if not url.startswith('ytsearch'):
-                url = f"ytsearch1:{url}"
-
         def _resolve():
-            """Resolve ke data info. Prioritas: download ke FILE (anti-403).
-            Kalau download gagal, baru coba ambil direct stream URL."""
-            # 1) Coba download ke file lokal (paling andal di IP datacenter)
-            try:
-                data = _extract_info_with_fallback(url, download=True)
-                if data.get('entries'):
-                    data = data['entries'][0]
-                if data:
-                    # yt-dlp set filepath / _filename setelah download
-                    fn = (data.get('filepath')
-                          or data.get('_filename')
-                          or ytdl.prepare_filename(data))
-                    if fn and os.path.exists(fn):
-                        return data, fn
-            except Exception as e:
-                ytdl_log.warning(f"download=True gagal, coba stream URL: {e}")
+            """Resolve ke audio source. Prioritas: YouTube -> Auto-Fallback: SoundCloud."""
+            nonlocal url
+            is_direct_url = url.startswith(('http://', 'https://', 'www.'))
+            if not is_direct_url and not url.startswith(('ytsearch', 'scsearch')):
+                yt_query = f"ytsearch1:{url}"
+            else:
+                yt_query = url
 
-            # 2) Fallback: direct stream URL
-            data = _extract_info_with_fallback(url, download=False)
-            if not data:
-                raise Exception("YouTube extraction kosong (data None)")
-            if data.get('entries'):
-                data = data['entries'][0]
-                if not data.get('url'):
-                    video_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
-                    data = _extract_info_with_fallback(video_url, download=False)
+            yt_err = None
+            # 1) Coba YouTube dulu jika bukan link SoundCloud eksplisit
+            if 'soundcloud.com' not in yt_query and not yt_query.startswith('scsearch'):
+                try:
+                    data = _extract_info_with_fallback(yt_query, download=True)
                     if data and data.get('entries'):
                         data = data['entries'][0]
-            elif 'entries' in data:
-                raise Exception("Tidak ada hasil pencarian di YouTube.")
-            if not data.get('url'):
-                raise Exception("No stream URL")
-            return data, None
+                    if data:
+                        fn = (data.get('filepath')
+                              or data.get('_filename')
+                              or ytdl.prepare_filename(data))
+                        if fn and os.path.exists(fn):
+                            return data, fn
+                except Exception as e:
+                    yt_err = e
+                    ytdl_log.warning(f"YouTube download=True gagal ({yt_query}): {e}")
+
+                try:
+                    data = _extract_info_with_fallback(yt_query, download=False)
+                    if data and data.get('entries'):
+                        data = data['entries'][0]
+                    if data and not data.get('url'):
+                        video_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
+                        data = _extract_info_with_fallback(video_url, download=False)
+                        if data and data.get('entries'):
+                            data = data['entries'][0]
+                    if data and data.get('url'):
+                        return data, None
+                except Exception as e:
+                    yt_err = e
+                    ytdl_log.warning(f"YouTube download=False gagal ({yt_query}): {e}")
+
+            # 2) AUTO-FALLBACK KE SOUNDCLOUD (Jika YouTube kena bot-check / 403 / error)
+            fallback_query = None
+            orig_title = None
+
+            if not is_direct_url:
+                fallback_query = re.sub(r'^ytsearch\d*:\s*', '', url).strip()
+            elif 'youtube.com' in url or 'youtu.be' in url:
+                orig_title = _get_yt_oembed_title(url)
+                if orig_title:
+                    fallback_query = _clean_track_title(orig_title) or orig_title
+            elif 'soundcloud.com' in url or url.startswith('scsearch'):
+                fallback_query = url
+
+            if fallback_query:
+                ytdl_log.info(f"[music-fallback] Menjalankan fallback SoundCloud: '{fallback_query}'")
+                if fallback_query.startswith(('http://', 'https://')):
+                    try:
+                        sc_data = ytdl.extract_info(fallback_query, download=True)
+                        if sc_data:
+                            fn = sc_data.get('filepath') or sc_data.get('_filename') or ytdl.prepare_filename(sc_data)
+                            if fn and os.path.exists(fn):
+                                return sc_data, fn
+                        sc_data = ytdl.extract_info(fallback_query, download=False)
+                        if sc_data and sc_data.get('url'):
+                            return sc_data, None
+                    except Exception as e:
+                        ytdl_log.warning(f"Direct SoundCloud link gagal: {e}")
+                else:
+                    sc_data, sc_fn = _extract_from_soundcloud(fallback_query, download=True)
+                    if not sc_data and not sc_fn:
+                        sc_data, sc_fn = _extract_from_soundcloud(fallback_query, download=False)
+                    if sc_data:
+                        if orig_title and not sc_data.get('title'):
+                            sc_data['title'] = orig_title
+                        return sc_data, sc_fn
+
+            if yt_err:
+                raise yt_err
+            raise Exception("Lagu tidak dapat ditemukan di YouTube maupun SoundCloud.")
 
         data, local_file = await loop.run_in_executor(None, _resolve)
 
         if not data or not isinstance(data, dict):
-            raise Exception("YouTube extraction kosong / hasil pencarian tidak ditemukan.")
+            raise Exception("YouTube/SoundCloud extraction kosong / hasil pencarian tidak ditemukan.")
 
         # Pilih sumber: file lokal (aman) atau stream URL (dengan header lengkap)
         if local_file and os.path.exists(local_file):
@@ -298,7 +393,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         else:
             source_path = data.get('url')
             if not source_path:
-                raise Exception("Gagal mendapatkan URL stream / file dari YouTube.")
+                raise Exception("Gagal mendapatkan URL stream / file lagu.")
             opts = _build_ffmpeg_options(data)
 
         return cls(discord.FFmpegPCMAudio(source_path, **opts), data=data)
@@ -634,28 +729,13 @@ async def _autoplay_next(guild_id, voice_client, channel):
         return
     query = random.choice(AUTOPLAY_POOL)
     try:
-        search_query = f"ytsearch1:{query}"
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(search_query, download=False))
-        if data and data.get('entries'):
-            data = data['entries'][0]
-            if not data.get('url'):
-                video_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
-                data = await loop.run_in_executor(None, lambda: _extract_info_with_fallback(video_url, download=False))
-                if data and data.get('entries'):
-                    data = data['entries'][0]
-        
-        webpage_url = data.get('webpage_url') or f"https://www.youtube.com/watch?v={data.get('id')}"
-        if not webpage_url:
-            return
-            
-        player = await YTDLSource.from_url(webpage_url, loop=client.loop, stream=True)
+        player = await YTDLSource.from_url(query, loop=client.loop, stream=True)
         if voice_client and not voice_client.is_playing():
             voice_client.play(player, after=lambda e: play_next(guild_id, voice_client, channel))
             view = MusicControlView(guild_id)
             embed = discord.Embed(
-                title="🎵 Autoplay (Musik Random Rekomendasi)",
-                description=f"Antrean habis, bot otomatis memutar: [{player.title}]({player.url})",
+                title="🎵 Autoplay (Musik Rekomendasi)",
+                description=f"Antrean habis, otomatis memutar: [{player.title}]({player.url})",
                 color=0x7289da
             )
             await channel.send(embed=embed, view=view)
