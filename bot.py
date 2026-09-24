@@ -708,9 +708,11 @@ class MusicControlView(discord.ui.View):
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         voice_client = interaction.guild.voice_client
         if voice_client:
-            await voice_client.disconnect()
+            if voice_client.is_playing() or voice_client.is_paused():
+                voice_client.stop()
             music_queues[self.guild_id] = []
-            await interaction.response.send_message("🛑 Musik dihentikan dan bot disconnect.", ephemeral=True)
+            music_loop[self.guild_id] = False
+            await interaction.response.send_message("⏹️ Musik dihentikan & antrean dikosongkan. (Bot tetap standby 24/7 di voice channel)", ephemeral=True)
         else:
             await interaction.response.send_message("❌ Bot lagi gak ada di channel.", ephemeral=True)
 
@@ -730,15 +732,19 @@ async def _autoplay_next(guild_id, voice_client, channel):
     query = random.choice(AUTOPLAY_POOL)
     try:
         player = await YTDLSource.from_url(query, loop=client.loop, stream=True)
-        if voice_client and not voice_client.is_playing():
+        if voice_client and voice_client.is_connected() and not voice_client.is_playing():
             voice_client.play(player, after=lambda e: play_next(guild_id, voice_client, channel))
-            view = MusicControlView(guild_id)
-            embed = discord.Embed(
-                title="🎵 Autoplay (Musik Rekomendasi)",
-                description=f"Antrean habis, otomatis memutar: [{player.title}]({player.url})",
-                color=0x7289da
-            )
-            await channel.send(embed=embed, view=view)
+            if channel:
+                view = MusicControlView(guild_id)
+                embed = discord.Embed(
+                    title="🎵 Autoplay (Musik Rekomendasi 24/7)",
+                    description=f"Antrean kosong, otomatis memutar: [{player.title}]({player.url})",
+                    color=0x7289da
+                )
+                try:
+                    await channel.send(embed=embed, view=view)
+                except Exception:
+                    pass
     except Exception as e:
         logger.error(f"Autoplay error: {e}")
 
@@ -1704,7 +1710,13 @@ async def slash_play(interaction: discord.Interaction, query: str):
                     await voice_client.disconnect(force=True)
                 except:
                     pass
-            voice_client = await member.voice.channel.connect()
+            voice_client = await member.voice.channel.connect(self_deaf=True, reconnect=True)
+
+        # Aktifkan persistensi 24/7 di channel ini agar bot tidak pernah keluar
+        try:
+            set_voice_247(interaction.guild.id, member.voice.channel.id, interaction.channel.id)
+        except Exception:
+            pass
 
         # --- Spotify detect: link open.spotify.com / awalan 'spotify:' ---
         spotify_label = None
@@ -1810,11 +1822,7 @@ async def slash_play(interaction: discord.Interaction, query: str):
 
     except Exception as e:
         logger.error(f"Music Error: {e}\n{traceback.format_exc()}")
-        try:
-            if interaction.guild.voice_client and interaction.guild.voice_client.is_connected():
-                await interaction.guild.voice_client.disconnect(force=True)
-        except:
-            pass
+        # Mode 24/7: Bot tetap berada di voice channel meski terjadi error putar lagu
 
         err_msg = _translate_music_error(e)
         try:
@@ -1897,16 +1905,66 @@ async def slash_nowplaying(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("❌ Gak ada lagu yang lagi diputar bro.", ephemeral=True)
 
-@tree.command(name="sstop", description="Stop musik & keluar voice channel (Seraphine)")
+@tree.command(name="sstop", description="Stop musik & bersihkan antrean (Bot tetap standby 24/7)")
 async def slash_stop(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
     if voice_client:
-        await voice_client.disconnect()
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
         music_queues[interaction.guild.id] = []
         music_loop[interaction.guild.id] = False
-        await interaction.response.send_message("🛑 Musik dihentikan dan bot disconnect.")
+        await interaction.response.send_message("⏹️ Musik dihentikan & antrean dikosongkan. Bot tetap standby di voice channel 24/7 bro.")
     else:
         await interaction.response.send_message("❌ Bot lagi gak ada di voice channel.", ephemeral=True)
+
+@tree.command(name="sleave", description="Keluarkan bot dari voice channel & matikan mode 24/7")
+async def slash_leave(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Hanya bisa digunakan di server bro!", ephemeral=True)
+        return
+    remove_voice_247(interaction.guild.id)
+    voice_client = interaction.guild.voice_client
+    if voice_client:
+        music_queues[interaction.guild.id] = []
+        music_loop[interaction.guild.id] = False
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+        await voice_client.disconnect(force=True)
+        await interaction.response.send_message("👋 Bot telah keluar dari voice channel dan mode 24/7 dimatikan.")
+    else:
+        await interaction.response.send_message("❌ Bot lagi gak ada di voice channel.", ephemeral=True)
+
+@tree.command(name="s247", description="Kunci mode 24/7 agar Seraphine tidak pernah keluar voice channel")
+@app_commands.describe(status="Status 24/7: on (kunci 24/7) atau off (matikan)")
+@app_commands.choices(status=[
+    app_commands.Choice(name="🟢 ON - Standby 24/7 di channel ini", value="on"),
+    app_commands.Choice(name="🔴 OFF - Matikan mode 24/7", value="off")
+])
+async def slash_247(interaction: discord.Interaction, status: str):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Hanya bisa digunakan di server bro!", ephemeral=True)
+        return
+    
+    if status == "on":
+        member = interaction.guild.get_member(interaction.user.id)
+        target_vc = member.voice.channel if (member and member.voice) else None
+        if not target_vc and interaction.guild.voice_client:
+            target_vc = interaction.guild.voice_client.channel
+        
+        if not target_vc:
+            await interaction.response.send_message("❌ Kamu harus masuk voice channel dulu untuk mengunci bot 24/7 di sana!", ephemeral=True)
+            return
+
+        set_voice_247(interaction.guild.id, target_vc.id, interaction.channel.id)
+        if not interaction.guild.voice_client or not interaction.guild.voice_client.is_connected():
+            await target_vc.connect(self_deaf=True, reconnect=True)
+        elif interaction.guild.voice_client.channel != target_vc:
+            await interaction.guild.voice_client.move_to(target_vc)
+            
+        await interaction.response.send_message(f"🔒 **Mode 24/7 AKTIF!** Seraphine terkunci di voice channel **{target_vc.name}** dan otomatis reconnect jika terputus.")
+    else:
+        remove_voice_247(interaction.guild.id)
+        await interaction.response.send_message("🔓 **Mode 24/7 DIMATIKAN.** (Bot tidak akan auto-reconnect lagi jika disconnect).")
 
 @tree.command(name="sloop", description="Toggle loop lagu yang lagi diputar (Seraphine)")
 async def slash_loop(interaction: discord.Interaction):
@@ -1969,6 +2027,13 @@ def init_db():
             reason TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )''')
+
+        # Voice 24/7 persistence table
+        c.execute('''CREATE TABLE IF NOT EXISTS voice_247 (
+            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            text_channel_id INTEGER DEFAULT 0
+        )''')
         
         conn.commit()
         conn.close()
@@ -1978,6 +2043,41 @@ def init_db():
 
 # Initialize DB on module load so dashboard/Railway imports create tables automatically
 init_db()
+
+def set_voice_247(guild_id: int, channel_id: int, text_channel_id: int = 0):
+    """Simpan channel voice 24/7 ke SQLite agar bot auto-reconnect saat startup / terputus."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO voice_247 (guild_id, channel_id, text_channel_id) VALUES (?, ?, ?)',
+                  (guild_id, channel_id, text_channel_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error set_voice_247: {e}")
+
+def get_all_voice_247():
+    """Ambil semua konfigurasi voice 24/7 yang aktif."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('SELECT guild_id, channel_id, text_channel_id FROM voice_247')
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+def remove_voice_247(guild_id: int):
+    """Hapus setting voice 24/7 untuk guild."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute('DELETE FROM voice_247 WHERE guild_id = ?', (guild_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error remove_voice_247: {e}")
 
 def save_conversation(user_id: int, user_msg: str, bot_response: str, channel_id: int = 0):
     """Save conversation to database."""
@@ -2606,6 +2706,65 @@ def is_moderator(member: discord.Member) -> bool:
 #  DISCORD EVENTS
 # ============================================================
 
+_WATCHDOG_TASK = None
+
+async def voice_247_watchdog():
+    """Background watchdog: menjaga bot tetap di voice channel 24/7 dan auto-reconnect."""
+    await client.wait_until_ready()
+    logger.info("[24/7] Voice 24/7 watchdog loop aktif.")
+    while not client.is_closed():
+        try:
+            records = get_all_voice_247()
+            env_gid = os.environ.get("VOICE_247_GUILD_ID")
+            env_cid = os.environ.get("VOICE_247_CHANNEL_ID")
+            if env_gid and env_cid:
+                try:
+                    eg = int(env_gid)
+                    ec = int(env_cid)
+                    if not any(r[0] == eg for r in records):
+                        records.append((eg, ec, 0))
+                except Exception:
+                    pass
+
+            for guild_id, channel_id, text_channel_id in records:
+                guild = client.get_guild(guild_id)
+                if not guild:
+                    continue
+                vchannel = guild.get_channel(channel_id)
+                if not vchannel or not isinstance(vchannel, (discord.VoiceChannel, discord.StageChannel)):
+                    continue
+
+                vc = guild.voice_client
+                # 1. Jika belum connect atau terputus, reconnect otomatis
+                if not vc or not vc.is_connected():
+                    try:
+                        logger.info(f"[24/7] Auto-reconnecting ke voice channel '{vchannel.name}' di {guild.name}")
+                        if vc:
+                            try:
+                                await vc.disconnect(force=True)
+                            except Exception:
+                                pass
+                        vc = await vchannel.connect(self_deaf=True, reconnect=True, timeout=20.0)
+                    except Exception as e:
+                        logger.warning(f"[24/7] Gagal auto-reconnect ke {vchannel.name}: {e}")
+                        continue
+
+                # 2. Jika connected tapi di channel yang salah, pindahkan
+                if vc and vc.channel != vchannel:
+                    try:
+                        await vc.move_to(vchannel)
+                    except Exception:
+                        pass
+
+                # 3. Jika connected tapi lagu sedang kosong / berhenti, picu autoplay agar tidak hening
+                if vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused():
+                    if not music_queues[guild_id]:
+                        t_channel = guild.get_channel(text_channel_id) if text_channel_id else None
+                        asyncio.create_task(_autoplay_next(guild_id, vc, t_channel))
+        except Exception as e:
+            logger.error(f"[24/7] Watchdog error: {e}")
+        await asyncio.sleep(20)
+
 @client.event
 async def on_ready():
     logger.info("=" * 50)
@@ -2626,6 +2785,12 @@ async def on_ready():
     await client.change_presence(
         activity=discord.Activity(type=discord.ActivityType.listening, name="/shelp")
     )
+
+    # Start 24/7 Voice Watchdog loop jika belum jalan
+    global _WATCHDOG_TASK
+    if _WATCHDOG_TASK is None or _WATCHDOG_TASK.done():
+        _WATCHDOG_TASK = asyncio.create_task(voice_247_watchdog())
+        logger.info("✅ [24/7] Voice Watchdog background task aktif!")
 
 @client.event
 async def on_voice_state_update(member, before, after):
