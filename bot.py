@@ -726,6 +726,22 @@ AUTOPLAY_POOL = [
     "top hits indonesia santai",
 ]
 
+# Guard agar autoplay tidak di-spawn berkali-kali (penyebab spam request -> bot di-kick Discord)
+_autoplay_inflight = {}
+
+async def _autoplay_guarded(guild_id, voice_client, channel):
+    """Wrapper _autoplay_next dengan guard + backoff: satu task per guild,
+    dan jeda minimal 30 detik antar percobaan supaya tidak flood gateway Discord."""
+    try:
+        await _autoplay_next(guild_id, voice_client, channel)
+    finally:
+        # Cooldown: tugas selesai, tapi tahan 30 detik sebelum watchdog boleh
+        # mencoba lagi (kalau lagu tetap gagal load, tidak spam).
+        async def _release():
+            await asyncio.sleep(30)
+            _autoplay_inflight[guild_id] = False
+        asyncio.create_task(_release())
+
 async def _autoplay_next(guild_id, voice_client, channel):
     if not voice_client or not voice_client.is_connected():
         return
@@ -734,6 +750,7 @@ async def _autoplay_next(guild_id, voice_client, channel):
         player = await YTDLSource.from_url(query, loop=client.loop, stream=True)
         if voice_client and voice_client.is_connected() and not voice_client.is_playing():
             voice_client.play(player, after=lambda e: play_next(guild_id, voice_client, channel))
+            logger.info(f"[24/7] Autoplay memutar '{player.title}'")
             if channel:
                 view = MusicControlView(guild_id)
                 embed = discord.Embed(
@@ -2737,6 +2754,19 @@ async def voice_247_watchdog():
                 vc = guild.voice_client
                 # 1. Jika belum connect atau terputus, reconnect otomatis
                 if not vc or not vc.is_connected():
+                    # Cek permission bot dulu: kalau tidak punya Connect/Speak,
+                    # skip tanpa spam log (mis. channel stage yang butuh request-to-speak).
+                    try:
+                        me = guild.me
+                        perms = vchannel.permissions_for(me) if me else None
+                        if perms and not perms.connect:
+                            logger.warning(f"[24/7] Tidak punya izin Connect ke '{vchannel.name}', skip.")
+                            continue
+                        if perms and not perms.speak:
+                            logger.warning(f"[24/7] Tidak punya izin Speak di '{vchannel.name}', skip.")
+                            continue
+                    except Exception:
+                        pass
                     try:
                         logger.info(f"[24/7] Auto-reconnecting ke voice channel '{vchannel.name}' di {guild.name}")
                         if vc:
@@ -2745,6 +2775,7 @@ async def voice_247_watchdog():
                             except Exception:
                                 pass
                         vc = await vchannel.connect(self_deaf=True, reconnect=True, timeout=20.0)
+                        logger.info(f"[24/7] ✅ Berhasil connect ke '{vchannel.name}'")
                     except Exception as e:
                         logger.warning(f"[24/7] Gagal auto-reconnect ke {vchannel.name}: {e}")
                         continue
@@ -2757,10 +2788,13 @@ async def voice_247_watchdog():
                         pass
 
                 # 3. Jika connected tapi lagu sedang kosong / berhenti, picu autoplay agar tidak hening
+                #    Guard: hanya picu kalau tidak ada task autoplay yang sedang jalan,
+                #    supaya tidak spam request (penyebab bot ke-kick Discord).
                 if vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused():
-                    if not music_queues[guild_id]:
+                    if not music_queues[guild_id] and not _autoplay_inflight.get(guild_id):
+                        _autoplay_inflight[guild_id] = True
                         t_channel = guild.get_channel(text_channel_id) if text_channel_id else None
-                        asyncio.create_task(_autoplay_next(guild_id, vc, t_channel))
+                        asyncio.create_task(_autoplay_guarded(guild_id, vc, t_channel))
         except Exception as e:
             logger.error(f"[24/7] Watchdog error: {e}")
         await asyncio.sleep(20)
