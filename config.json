@@ -2,5 +2,7 @@
     "ai_chat_enabled": true,
     "music_enabled": true,
     "automod_enabled": true,
-    "voice_log_enabled": false
+    "voice_log_enabled": false,
+    "autorole_enabled": true,
+    "autorole_role_id": 1533458688667549706
 }
